@@ -1,9 +1,9 @@
 {
 	"id": "sync-assets",
 	"name": "Sync Assets",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"minAppVersion": "1.7.2",
-	"description": "Detect and repair oversized community plugin assets skipped by Obsidian Sync.",
+	"description": "Detect and repair oversized community plugin assets skipped during sync.",
 	"author": "Hasan Yılmaz",
 	"authorUrl": "https://github.com/hasanyilmaz",
 	"isDesktopOnly": false

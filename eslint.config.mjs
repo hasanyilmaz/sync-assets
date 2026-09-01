@@ -68,17 +68,6 @@ export default tseslint.config(
 		},
 	},
 	{
-		files: [
-			"src/integrity-verification.ts",
-			"src/repair-lifecycle.ts",
-			"src/repair-transaction.ts",
-		],
-		rules: {
-			// These pure services share Web Crypto between Obsidian and the Node test runtime.
-			"obsidianmd/no-global-this": "off",
-		},
-	},
-	{
 		files: ["manifest.json"],
 		language: "json/json",
 		plugins: {

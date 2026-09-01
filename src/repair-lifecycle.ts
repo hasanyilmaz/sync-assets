@@ -573,10 +573,10 @@ export async function deleteVerifiedBackups(
 }
 
 export function createSessionId(): string {
-	if (globalThis.crypto?.getRandomValues === undefined) {
+	if (window.crypto?.getRandomValues === undefined) {
 		throw new Error("Web Crypto random values are unavailable in this runtime.");
 	}
 	const bytes = new Uint8Array(16);
-	globalThis.crypto.getRandomValues(bytes);
+	window.crypto.getRandomValues(bytes);
 	return `session-${Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("")}`;
 }

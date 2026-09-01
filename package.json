@@ -1,7 +1,7 @@
 {
 	"name": "sync-assets",
-	"version": "1.0.0",
-	"description": "Detect and repair oversized community plugin assets skipped by Obsidian Sync.",
+	"version": "1.0.1",
+	"description": "Detect and repair oversized community plugin assets skipped during sync.",
 	"type": "module",
 	"private": true,
 	"license": "MIT",

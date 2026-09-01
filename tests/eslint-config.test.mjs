@@ -28,11 +28,9 @@ describe("ESLint quality gate configuration", () => {
 		expect(config.rules["obsidianmd/ui/sentence-case"]?.[0]).toBe(1);
 	});
 
-	it("limits the Web Crypto exception to the three shared runtime services", async () => {
+	it("enforces popout-compatible global access in Web Crypto services", async () => {
 		const cryptoConfig = await configFor("src/integrity-verification.ts");
-		const uiConfig = await configFor("src/plugin-ui.ts");
-		expect(cryptoConfig.rules["obsidianmd/no-global-this"]).toEqual([0]);
-		expect(uiConfig.rules["obsidianmd/no-global-this"]?.[0]).not.toBe(0);
+		expect(cryptoConfig.rules["obsidianmd/no-global-this"]?.[0]).not.toBe(0);
 	});
 
 	it("validates the Obsidian manifest as an error", async () => {

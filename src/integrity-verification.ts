@@ -180,11 +180,11 @@ function endsWithObsidianNoSourceMapSuffix(bytes: ArrayBuffer): boolean {
 }
 
 export async function sha256ArrayBuffer(bytes: ArrayBuffer): Promise<string> {
-	if (globalThis.crypto?.subtle === undefined) {
+	if (window.crypto?.subtle === undefined) {
 		throw new Error("Web Crypto SHA-256 is unavailable in this runtime.");
 	}
 
-	const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+	const digest = await window.crypto.subtle.digest("SHA-256", bytes);
 	const hex = Array.from(new Uint8Array(digest), byte => (
 		byte.toString(16).padStart(2, "0")
 	)).join("");
