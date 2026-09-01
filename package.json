@@ -1,22 +1,29 @@
 {
 	"name": "sync-assets",
-	"version": "0.1.0",
+	"version": "1.0.0",
 	"description": "Detect and repair oversized community plugin assets skipped by Obsidian Sync.",
 	"type": "module",
 	"private": true,
-	"license": "GPL-3.0-or-later",
+	"license": "MIT",
 	"scripts": {
 		"dev": "node esbuild.config.mjs development",
 		"build": "tsc --noEmit && node esbuild.config.mjs production",
-		"lint": "eslint .",
-		"check": "npm run lint && npm run build"
+		"lint": "eslint . --quiet",
+		"lint:report": "eslint .",
+		"lint:strict": "eslint . --max-warnings 0",
+		"test": "vitest run",
+		"release:guard": "node scripts/release-guard.mjs",
+		"check": "npm run lint:strict && npm run build && npm run test && npm run release:guard"
 	},
 	"devDependencies": {
 		"@eslint/js": "10.0.1",
+		"@eslint/json": "2.0.0",
 		"esbuild": "0.28.1",
 		"eslint": "10.5.0",
+		"eslint-plugin-obsidianmd": "0.4.2",
 		"obsidian": "1.13.0",
 		"typescript": "5.9.3",
-		"typescript-eslint": "8.61.0"
+		"typescript-eslint": "8.61.0",
+		"vitest": "4.1.11"
 	}
 }
