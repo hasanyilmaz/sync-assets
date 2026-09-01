@@ -11,6 +11,8 @@ import { inspectRelease } from "../scripts/release-guard-core.mjs";
 
 const fixtureRoots = [];
 const releaseGuardPath = fileURLToPath(new URL("../scripts/release-guard.mjs", import.meta.url));
+const checkWorkflow = await readFile(fileURLToPath(new URL("../.github/workflows/check.yml", import.meta.url)), "utf8");
+const releaseWorkflow = await readFile(fileURLToPath(new URL("../.github/workflows/release.yml", import.meta.url)), "utf8");
 
 const requiredIgnoreEntries = [
 	"node_modules/",
@@ -36,6 +38,9 @@ const requiredIgnoreEntries = [
 	"*.rar",
 	"*.swp",
 	".DS_Store",
+	"AGENTS.md",
+	".agents/",
+	".codex/",
 ];
 
 const packageJson = {
@@ -45,6 +50,9 @@ const packageJson = {
 	type: "module",
 	private: true,
 	license: "MIT",
+	repository: "https://github.com/hasanyilmaz/sync-assets.git",
+	homepage: "https://github.com/hasanyilmaz/sync-assets#readme",
+	bugs: "https://github.com/hasanyilmaz/sync-assets/issues",
 	scripts: {
 		build: "tsc --noEmit && node esbuild.config.mjs production",
 		lint: "eslint . --quiet",
@@ -98,6 +106,8 @@ async function createFixture() {
 		writeFixtureFile(root, ".gitignore", `${requiredIgnoreEntries.join("\n")}\n`),
 		writeFixtureFile(root, "main.js", "(() => { \"use strict\"; })();\n"),
 		writeFixtureFile(root, "styles.css", ".sync-assets { display: block; }\n"),
+		writeFixtureFile(root, ".github/workflows/check.yml", checkWorkflow),
+		writeFixtureFile(root, ".github/workflows/release.yml", releaseWorkflow),
 	]);
 	return root;
 }
@@ -190,6 +200,35 @@ describe("Sync Assets Release Guard", () => {
 		expect(result.ok).toBe(false);
 		expect(result.errors.join("\n")).toContain(".repair/");
 		expect(result.errors.join("\n")).toContain("data.json");
+	});
+
+	it.each([
+		[
+			"a missing release permission",
+			content => content.replace("  attestations: write", "  attestations: read"),
+			"attestation permission",
+		],
+		[
+			"a mutable action reference",
+			content => content.replace("actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d", "actions/attest@v4"),
+			"action references must be immutable",
+		],
+		[
+			"an incorrect release artifact",
+			content => content.replaceAll("styles.css", "release.zip"),
+			"exact attestation artifact list",
+		],
+		[
+			"automatic release publication",
+			content => `${content}\n      - run: gh release edit 1.0.0 --draft=false\n`,
+			"must not publish",
+		],
+	])("rejects %s in the release workflow", async (_label, update, expectedMessage) => {
+		const root = await createFixture();
+		await writeFixtureFile(root, ".github/workflows/release.yml", update(releaseWorkflow));
+		const result = await inspectRelease(root);
+		expect(result.ok).toBe(false);
+		expect(result.errors.join("\n")).toContain(expectedMessage);
 	});
 
 	it("returns a non-zero CLI status and prints every violation", async () => {

@@ -7,6 +7,12 @@ export const REQUIRED_RELEASE_ASSETS = Object.freeze([
 	"styles.css",
 ]);
 
+const CHECK_WORKFLOW_PATH = ".github/workflows/check.yml";
+const RELEASE_WORKFLOW_PATH = ".github/workflows/release.yml";
+const CHECKOUT_ACTION = "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd";
+const SETUP_NODE_ACTION = "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020";
+const ATTEST_ACTION = "actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d";
+
 const REQUIRED_IGNORE_PATTERNS = Object.freeze([
 	"node_modules/",
 	"main.js",
@@ -30,6 +36,9 @@ const REQUIRED_IGNORE_PATTERNS = Object.freeze([
 	"*.7z",
 	"*.rar",
 	"*.swp",
+	"AGENTS.md",
+	".agents/",
+	".codex/",
 ]);
 
 const SCAN_EXCLUDED_DIRECTORIES = new Set([
@@ -100,6 +109,9 @@ function checkPackageContracts(pkg, manifest, versions, lock, errors) {
 		requireEqual(errors, "package.json name", pkg.name, "sync-assets");
 		requireEqual(errors, "package.json private", pkg.private, true);
 		requireEqual(errors, "package.json license", pkg.license, "MIT");
+		requireEqual(errors, "package.json repository", pkg.repository, "https://github.com/hasanyilmaz/sync-assets.git");
+		requireEqual(errors, "package.json homepage", pkg.homepage, "https://github.com/hasanyilmaz/sync-assets#readme");
+		requireEqual(errors, "package.json bugs", pkg.bugs, "https://github.com/hasanyilmaz/sync-assets/issues");
 		for (const [scriptName, expected] of Object.entries(EXPECTED_SCRIPTS)) {
 			requireEqual(errors, `package.json scripts.${scriptName}`, pkg.scripts?.[scriptName], expected);
 		}
@@ -124,6 +136,79 @@ function checkPackageContracts(pkg, manifest, versions, lock, errors) {
 		const lockRoot = lock.packages?.[""];
 		requireEqual(errors, "package-lock.json root name", lockRoot?.name, pkg.name);
 		requireEqual(errors, "package-lock.json root version", lockRoot?.version, pkg.version);
+	}
+}
+
+function actionReferences(workflowText) {
+	return [...workflowText.matchAll(/^\s*uses:\s*(\S+)/gmu)].map(match => match[1]);
+}
+
+function requireWorkflowText(errors, relativePath, workflowText, expectedText, label) {
+	if (!workflowText.includes(expectedText)) {
+		errors.push(`${relativePath}: missing required ${label}`);
+	}
+}
+
+function checkActionReferences(errors, relativePath, workflowText, expectedReferences) {
+	const actualReferences = actionReferences(workflowText);
+	if (JSON.stringify(actualReferences) !== JSON.stringify(expectedReferences)) {
+		errors.push(`${relativePath}: action references must be immutable and exactly ${expectedReferences.join(", ")}`);
+	}
+}
+
+function checkWorkflowContracts(checkWorkflowText, releaseWorkflowText, errors) {
+	if (checkWorkflowText !== null) {
+		for (const [expectedText, label] of [
+			["  push:\n    branches:\n      - main", "main push trigger"],
+			["  pull_request:\n    branches:\n      - main", "main pull request trigger"],
+			["permissions:\n  contents: read", "read-only permissions"],
+			["node-version: 24", "Node.js 24 runtime"],
+			["package-manager-cache: false", "disabled package-manager cache"],
+			["run: npm ci", "clean dependency installation"],
+			["run: npm run check", "full check command"],
+		]) {
+			requireWorkflowText(errors, CHECK_WORKFLOW_PATH, checkWorkflowText, expectedText, label);
+		}
+		if (/^\s{2}[\w-]+:\s*write\s*$/mu.test(checkWorkflowText)) {
+			errors.push(`${CHECK_WORKFLOW_PATH}: validation workflow must not request write permissions`);
+		}
+		checkActionReferences(errors, CHECK_WORKFLOW_PATH, checkWorkflowText, [
+			CHECKOUT_ACTION,
+			SETUP_NODE_ACTION,
+		]);
+	}
+
+	if (releaseWorkflowText !== null) {
+		for (const [expectedText, label] of [
+			["  workflow_dispatch:", "manual workflow trigger"],
+			["  contents: write", "contents write permission"],
+			["  id-token: write", "OIDC permission"],
+			["  attestations: write", "attestation permission"],
+			["  artifact-metadata: write", "artifact metadata permission"],
+			["node-version: 24", "Node.js 24 runtime"],
+			["package-manager-cache: false", "disabled package-manager cache"],
+			["run: npm ci", "clean dependency installation"],
+			["run: npm run check", "full check command"],
+			["subject-path: |\n            main.js\n            manifest.json\n            styles.css", "exact attestation artifact list"],
+			["            main.js manifest.json styles.css", "exact release artifact list"],
+			["            --draft", "draft-only release creation"],
+		]) {
+			requireWorkflowText(errors, RELEASE_WORKFLOW_PATH, releaseWorkflowText, expectedText, label);
+		}
+		if (/^\s{2}(?:pull_request|push|release|schedule):/mu.test(releaseWorkflowText)) {
+			errors.push(`${RELEASE_WORKFLOW_PATH}: release preparation must be manual only`);
+		}
+		if (/gh release edit|--draft(?:=|\s+)false/u.test(releaseWorkflowText)) {
+			errors.push(`${RELEASE_WORKFLOW_PATH}: workflow must not publish a draft release automatically`);
+		}
+		if (/\.(?:7z|gz|rar|tar|tgz|zip)\b/u.test(releaseWorkflowText)) {
+			errors.push(`${RELEASE_WORKFLOW_PATH}: archive artifacts are not allowed`);
+		}
+		checkActionReferences(errors, RELEASE_WORKFLOW_PATH, releaseWorkflowText, [
+			CHECKOUT_ACTION,
+			SETUP_NODE_ACTION,
+			ATTEST_ACTION,
+		]);
 	}
 }
 
@@ -227,7 +312,17 @@ function checkBundle(bundleText, errors) {
 
 export async function inspectRelease(rootDir) {
 	const errors = [];
-	const [pkg, manifest, versions, lock, licenseText, ignoreText, bundleText] = await Promise.all([
+	const [
+		pkg,
+		manifest,
+		versions,
+		lock,
+		licenseText,
+		ignoreText,
+		bundleText,
+		checkWorkflowText,
+		releaseWorkflowText,
+	] = await Promise.all([
 		readRequiredJson(rootDir, "package.json", errors),
 		readRequiredJson(rootDir, "manifest.json", errors),
 		readRequiredJson(rootDir, "versions.json", errors),
@@ -235,12 +330,15 @@ export async function inspectRelease(rootDir) {
 		readRequiredText(rootDir, "LICENSE", errors),
 		readRequiredText(rootDir, ".gitignore", errors),
 		readRequiredText(rootDir, "main.js", errors),
+		readRequiredText(rootDir, CHECK_WORKFLOW_PATH, errors),
+		readRequiredText(rootDir, RELEASE_WORKFLOW_PATH, errors),
 	]);
 
 	checkPackageContracts(pkg, manifest, versions, lock, errors);
 	checkLicense(licenseText, errors);
 	checkIgnorePolicy(ignoreText, errors);
 	checkBundle(bundleText, errors);
+	checkWorkflowContracts(checkWorkflowText, releaseWorkflowText, errors);
 	await Promise.all([
 		checkReleaseAssets(rootDir, errors),
 		checkWorkspacePaths(rootDir, errors),

@@ -5,6 +5,9 @@
 	"type": "module",
 	"private": true,
 	"license": "MIT",
+	"repository": "https://github.com/hasanyilmaz/sync-assets.git",
+	"homepage": "https://github.com/hasanyilmaz/sync-assets#readme",
+	"bugs": "https://github.com/hasanyilmaz/sync-assets/issues",
 	"scripts": {
 		"dev": "node esbuild.config.mjs development",
 		"build": "tsc --noEmit && node esbuild.config.mjs production",
