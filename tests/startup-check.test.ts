@@ -99,6 +99,21 @@ describe("startup integrity check", () => {
 		expect(calls).toEqual(["discover", "resolve", "verify"]);
 	});
 
+	it("reads the current settings state when layout becomes ready", async () => {
+		const calls: string[] = [];
+		let current = state(false);
+		const controller = new StartupCheckController(
+			new IntegrityCheckCoordinator(dependencies(calls)),
+			() => current,
+		);
+		current = state(true);
+
+		const outcome = await controller.runAfterLayoutReady();
+
+		expect(outcome.status).toBe("completed");
+		expect(calls).toEqual(["discover", "resolve", "verify"]);
+	});
+
 	it("lets a manual intent before layout suppress startup", async () => {
 		const calls: string[] = [];
 		const controller = new StartupCheckController(

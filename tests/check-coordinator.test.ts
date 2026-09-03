@@ -165,4 +165,39 @@ describe("integrity check coordinator", () => {
 		expect(run.status).toBe("failed");
 		expect(run.reason?.code).toBe("correlation-error");
 	});
+
+	it("discards a late stage completion after disposal without publishing state", async () => {
+		let finishDiscovery!: (value: LocalDiscoveryResult) => void;
+		let resolveCalls = 0;
+		const coordinator = new IntegrityCheckCoordinator({
+			discover: (): Promise<LocalDiscoveryResult> => new Promise(resolve => {
+				finishDiscovery = resolve;
+			}),
+			resolve: (): Promise<RemoteResolutionBatch> => {
+				resolveCalls += 1;
+				return Promise.resolve(REMOTE);
+			},
+			verify: (): Promise<IntegrityVerificationBatch> => Promise.resolve(VERIFICATION),
+		});
+		const snapshots: string[] = [];
+		coordinator.subscribe(snapshot => {
+			snapshots.push(`${snapshot.phase}:${snapshot.latestRun?.status ?? "none"}`);
+		});
+
+		const pending = coordinator.run(createDefaultSettings());
+		await Promise.resolve();
+		coordinator.dispose();
+		finishDiscovery(DISCOVERY);
+		const run = await pending;
+
+		expect(run.status).toBe("cancelled");
+		expect(run.reason?.code).toBe("integrity-check-cancelled");
+		expect(resolveCalls).toBe(0);
+		expect(coordinator.getSnapshot()).toEqual({
+			phase: "idle",
+			activeRunId: null,
+			latestRun: null,
+		});
+		expect(snapshots.at(-1)).toBe("discovering:none");
+	});
 });

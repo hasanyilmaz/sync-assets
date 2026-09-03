@@ -22,7 +22,7 @@ export type CheckTrigger = (typeof CHECK_TRIGGERS)[number];
 export interface IntegrityCheckRun {
 	readonly runId: number;
 	readonly trigger: CheckTrigger;
-	readonly status: "completed" | "failed";
+	readonly status: "completed" | "failed" | "cancelled";
 	readonly startedAtMs: number;
 	readonly finishedAtMs: number;
 	readonly settingsIssues: readonly ValidationIssue[];
@@ -77,6 +77,8 @@ export class IntegrityCheckCoordinator {
 	private activeRunId: number | null = null;
 	private latestRun: IntegrityCheckRun | null = null;
 	private nextRunId = 1;
+	private lifecycleGeneration = 0;
+	private disposed = false;
 	private readonly listeners = new Set<CheckCoordinatorListener>();
 
 	constructor(private readonly dependencies: CheckPipelineDependencies) {}
@@ -102,6 +104,13 @@ export class IntegrityCheckCoordinator {
 		settingsIssues: readonly ValidationIssue[] = [],
 		trigger: CheckTrigger = "manual",
 	): Promise<IntegrityCheckRun> {
+		if (this.disposed) {
+			return Promise.resolve(this.cancelledRun(
+				this.nextRunId,
+				trigger,
+				[...settingsIssues],
+			));
+		}
 		if (this.activePromise !== null) {
 			return this.activePromise;
 		}
@@ -109,15 +118,20 @@ export class IntegrityCheckCoordinator {
 		const runId = this.nextRunId;
 		this.nextRunId += 1;
 		this.activeRunId = runId;
+		const lifecycleGeneration = this.lifecycleGeneration;
 		const promise = Promise.resolve().then(() => this.execute(
 			runId,
 			trigger,
 			cloneSettings(settings),
 			[...settingsIssues],
+			lifecycleGeneration,
 		));
 		this.activePromise = promise;
 		void promise.finally(() => {
-			if (this.activePromise === promise) {
+			if (
+				this.activePromise === promise
+				&& this.isCurrent(lifecycleGeneration)
+			) {
 				this.activePromise = null;
 				this.activeRunId = null;
 				this.emit();
@@ -126,11 +140,24 @@ export class IntegrityCheckCoordinator {
 		return promise;
 	}
 
+	dispose(): void {
+		if (this.disposed) {
+			return;
+		}
+		this.disposed = true;
+		this.lifecycleGeneration += 1;
+		this.activePromise = null;
+		this.activeRunId = null;
+		this.phase = "idle";
+		this.listeners.clear();
+	}
+
 	private async execute(
 		runId: number,
 		trigger: CheckTrigger,
 		settings: SyncAssetsSettings,
 		settingsIssues: readonly ValidationIssue[],
+		lifecycleGeneration: number,
 	): Promise<IntegrityCheckRun> {
 		const now = this.dependencies.now ?? Date.now;
 		const startedAtMs = now();
@@ -141,10 +168,19 @@ export class IntegrityCheckCoordinator {
 		try {
 			this.setPhase("discovering");
 			discovery = await this.dependencies.discover(settings);
+			if (!this.isCurrent(lifecycleGeneration)) {
+				return this.cancelledRun(runId, trigger, settingsIssues, startedAtMs, discovery);
+			}
 			this.setPhase("resolving");
 			remote = await this.dependencies.resolve(discovery);
+			if (!this.isCurrent(lifecycleGeneration)) {
+				return this.cancelledRun(runId, trigger, settingsIssues, startedAtMs, discovery, remote);
+			}
 			this.setPhase("verifying");
 			verification = await this.dependencies.verify(discovery, remote);
+			if (!this.isCurrent(lifecycleGeneration)) {
+				return this.cancelledRun(runId, trigger, settingsIssues, startedAtMs, discovery, remote, verification);
+			}
 
 			const failed = verification.status === "error";
 			const run: IntegrityCheckRun = {
@@ -168,6 +204,9 @@ export class IntegrityCheckCoordinator {
 			this.setPhase(failed ? "failed" : "completed");
 			return run;
 		} catch (error) {
+			if (!this.isCurrent(lifecycleGeneration)) {
+				return this.cancelledRun(runId, trigger, settingsIssues, startedAtMs, discovery, remote, verification);
+			}
 			const run: IntegrityCheckRun = {
 				runId,
 				trigger,
@@ -187,6 +226,36 @@ export class IntegrityCheckCoordinator {
 			this.setPhase("failed");
 			return run;
 		}
+	}
+
+	private isCurrent(lifecycleGeneration: number): boolean {
+		return !this.disposed && lifecycleGeneration === this.lifecycleGeneration;
+	}
+
+	private cancelledRun(
+		runId: number,
+		trigger: CheckTrigger,
+		settingsIssues: readonly ValidationIssue[],
+		startedAtMs = (this.dependencies.now ?? Date.now)(),
+		discovery: LocalDiscoveryResult | null = null,
+		remote: RemoteResolutionBatch | null = null,
+		verification: IntegrityVerificationBatch | null = null,
+	): IntegrityCheckRun {
+		return {
+			runId,
+			trigger,
+			status: "cancelled",
+			startedAtMs,
+			finishedAtMs: (this.dependencies.now ?? Date.now)(),
+			settingsIssues,
+			discovery,
+			remote,
+			verification,
+			reason: reason(
+				"integrity-check-cancelled",
+				"Integrity check was cancelled because the plugin lifecycle ended.",
+			),
+		};
 	}
 
 	private setPhase(phase: CheckPhase): void {

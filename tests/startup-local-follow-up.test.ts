@@ -151,7 +151,7 @@ describe("startup local follow-up controller", () => {
 		expect(fullChecks).toBe(1);
 	});
 
-	it("does nothing when disabled, invalid, or unconfigured", () => {
+	it("keeps the three-minute window open when initial settings are ineligible", () => {
 		for (const state of [
 			settingsState({ settings: { ...settingsState().settings, startupCheckEnabled: false } }),
 			settingsState({ issues: [{ code: "invalid", path: "", message: "Invalid." }] }),
@@ -170,8 +170,120 @@ describe("startup local follow-up controller", () => {
 				schedule: scheduler.schedule,
 			}).start();
 			expect(probes).toBe(0);
-			expect(scheduler.tasks).toEqual([]);
+			expect(scheduler.tasks.map(task => task.delayMs)).toEqual(
+				STARTUP_LOCAL_FOLLOW_UP_DELAYS_MS,
+			);
 		}
+	});
+
+	it("runs one current check after late Sync settings remain stable for five seconds", async () => {
+		const scheduler = createScheduler();
+		let current = settingsState({
+			settings: { ...settingsState().settings, repositories: [] },
+		});
+		let fullChecks = 0;
+		const controller = new StartupLocalFollowUpController({
+			getSettingsState: (): SettingsState => current,
+			probe: (): Promise<string | null> => Promise.resolve("current-files"),
+			isBusy: (): boolean => false,
+			runFullCheck: (): Promise<IntegrityCheckRun | null> => {
+				fullChecks += 1;
+				return Promise.resolve({} as IntegrityCheckRun);
+			},
+			schedule: scheduler.schedule,
+		});
+
+		controller.start();
+		current = settingsState();
+		controller.notifySettingsChanged();
+		expect(fullChecks).toBe(0);
+		scheduler.runNext(STARTUP_LOCAL_STABILITY_DELAY_MS);
+		await flush();
+		expect(fullChecks).toBe(1);
+
+		current = settingsState({
+			settings: {
+				...settingsState().settings,
+				repositories: [{
+					pluginId: "second-plugin",
+					repository: { owner: "example", repo: "second" },
+				}],
+			},
+		});
+		controller.notifySettingsChanged();
+		expect(scheduler.tasks.filter(task => (
+			!task.cancelled && task.delayMs === STARTUP_LOCAL_STABILITY_DELAY_MS
+		))).toHaveLength(0);
+		expect(fullChecks).toBe(1);
+	});
+
+	it("debounces changing mappings and drops a disabled or removed scope immediately", async () => {
+		const scheduler = createScheduler();
+		let current = settingsState();
+		let fullChecks = 0;
+		const controller = new StartupLocalFollowUpController({
+			getSettingsState: (): SettingsState => current,
+			probe: (): Promise<string | null> => Promise.resolve("files"),
+			isBusy: (): boolean => false,
+			runFullCheck: (): Promise<IntegrityCheckRun | null> => {
+				fullChecks += 1;
+				return Promise.resolve({} as IntegrityCheckRun);
+			},
+			schedule: scheduler.schedule,
+		});
+		controller.start();
+		await flush();
+
+		current = settingsState({
+			settings: {
+				...settingsState().settings,
+				repositories: [{
+					pluginId: "changed",
+					repository: { owner: "example", repo: "changed" },
+				}],
+			},
+		});
+		controller.notifySettingsChanged();
+		current = settingsState({
+			settings: { ...settingsState().settings, startupCheckEnabled: false, repositories: [] },
+		});
+		controller.notifySettingsChanged();
+
+		expect(scheduler.tasks.filter(task => (
+			!task.cancelled && task.delayMs === STARTUP_LOCAL_STABILITY_DELAY_MS
+		))).toHaveLength(0);
+		expect(fullChecks).toBe(0);
+	});
+
+	it("retries a stable settings follow-up that loses a busy race without duplicating success", async () => {
+		const scheduler = createScheduler();
+		let current = settingsState({
+			settings: { ...settingsState().settings, repositories: [] },
+		});
+		let fullChecks = 0;
+		const controller = new StartupLocalFollowUpController({
+			getSettingsState: (): SettingsState => current,
+			probe: (): Promise<string | null> => Promise.resolve("files"),
+			isBusy: (): boolean => false,
+			runFullCheck: (): Promise<IntegrityCheckRun | null> => {
+				fullChecks += 1;
+				return Promise.resolve(fullChecks === 1 ? null : {} as IntegrityCheckRun);
+			},
+			schedule: scheduler.schedule,
+		});
+		controller.start();
+		current = settingsState();
+		controller.notifySettingsChanged();
+
+		scheduler.runNext(STARTUP_LOCAL_STABILITY_DELAY_MS);
+		await flush();
+		expect(fullChecks).toBe(1);
+		scheduler.runNext(STARTUP_LOCAL_STABILITY_DELAY_MS);
+		await flush();
+		expect(fullChecks).toBe(2);
+
+		controller.notifySettingsChanged();
+		expect(fullChecks).toBe(2);
 	});
 
 	it("skips a busy deadline and cancels pending work on unload", async () => {

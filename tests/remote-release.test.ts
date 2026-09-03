@@ -787,6 +787,33 @@ describe("rate limits, failures, and sequential ordering", () => {
 		expect(result.records[0]?.reason?.code).toBe("github-request-timeout");
 	});
 
+	it("ignores native HTTP completions that arrive after all attempt timeouts", async () => {
+		const completions: Array<(response: RemoteHttpResponse) => void> = [];
+		const result = await resolveRemoteReleases(
+			discoveryResult([discoveredPlugin("operon")]),
+			{
+				http: () => new Promise(resolve => {
+					completions.push(resolve);
+				}),
+				now: () => 1_000_000,
+				sleep: () => Promise.resolve(),
+				runWithTimeout: <T>(operation: () => Promise<T>): Promise<T> => {
+					void operation();
+					return Promise.reject(new RemoteRequestTimeoutError());
+				},
+			},
+		);
+		const completedSnapshot = JSON.stringify(result);
+
+		expect(completions).toHaveLength(3);
+		expect(result.records[0]?.reason?.code).toBe("github-request-timeout");
+		for (const complete of completions) {
+			complete(textResponse(200, "{}"));
+		}
+		await flushPromises();
+		expect(JSON.stringify(result)).toBe(completedSnapshot);
+	});
+
 	it("performs target requests sequentially in plugin-ID order", async () => {
 		const http = new FakeRemoteHttp();
 		const alpha = discoveredPlugin("alpha") as DiscoveredPluginRecord & { repository: GitHubRepository };
@@ -810,3 +837,8 @@ describe("rate limits, failures, and sequential ordering", () => {
 		]);
 	});
 });
+
+async function flushPromises(): Promise<void> {
+	await Promise.resolve();
+	await Promise.resolve();
+}

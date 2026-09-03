@@ -114,6 +114,9 @@ function buildStartupAttentionSummary(
 export function buildStartupRunDisposition(
 	run: IntegrityCheckRun,
 ): StartupRunDisposition {
+	if (run.status === "cancelled") {
+		return { disposition: "none" };
+	}
 	const presentation = buildCheckPresentation(run);
 	const actionablePlugins = presentation.groups.flatMap(group => (
 		["repair-available", "needs-attention", "configured-missing"].includes(group.id)

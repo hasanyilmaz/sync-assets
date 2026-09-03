@@ -90,7 +90,7 @@ export default class SyncAssetsPlugin extends Plugin {
 		});
 		this.settingsController = new SettingsController(persistence);
 		const settingsState = await this.settingsController.load();
-		const startupSettingsState = this.settingsController.getState();
+		const initialSettingsState = this.settingsController.getState();
 		this.settings = settingsState.settings;
 		if (settingsState.issues.length > 0) {
 			new Notice("Sync Assets settings are invalid. Safe defaults are active; open the plugin settings for details.", 0);
@@ -123,12 +123,12 @@ export default class SyncAssetsPlugin extends Plugin {
 		});
 		this.startupController = new StartupCheckController(
 			this.coordinator,
-			() => startupSettingsState,
+			() => this.settingsController?.getState() ?? initialSettingsState,
 		);
 		this.startupFollowUpController = new StartupLocalFollowUpController({
-			getSettingsState: (): SettingsState => this.settingsController?.getState() ?? startupSettingsState,
+			getSettingsState: (): SettingsState => this.settingsController?.getState() ?? initialSettingsState,
 			probe: (): Promise<string | null> => probeMonitoredLocalAssets(
-				(this.settingsController?.getState() ?? startupSettingsState).settings,
+				(this.settingsController?.getState() ?? initialSettingsState).settings,
 				{
 					adapter: this.app.vault.adapter,
 					configDir: this.app.vault.configDir,
@@ -178,6 +178,7 @@ export default class SyncAssetsPlugin extends Plugin {
 			this.settingsController,
 			settings => {
 				this.settings = settings;
+				this.startupFollowUpController?.notifySettingsChanged();
 			},
 			() => discoverInventory(this.settingsController?.getState().settings ?? createDefaultSettings()),
 			catalogSession,
@@ -216,6 +217,7 @@ export default class SyncAssetsPlugin extends Plugin {
 	onunload(): void {
 		this.loaded = false;
 		this.startupFollowUpController?.stop();
+		this.coordinator?.dispose();
 		this.resultsModal?.close();
 	}
 
@@ -226,6 +228,7 @@ export default class SyncAssetsPlugin extends Plugin {
 		const state = await this.settingsController.load();
 		this.settings = state.settings;
 		this.settingTab?.reloadFromController();
+		this.startupFollowUpController?.notifySettingsChanged();
 		if (state.issues.length > 0) {
 			new Notice("Sync Assets settings are invalid. Safe defaults are active; open the plugin settings for details.", 0);
 		}
@@ -242,7 +245,13 @@ export default class SyncAssetsPlugin extends Plugin {
 		}
 		const state = this.settingsController.getState();
 		const run = await this.coordinator.run(state.settings, state.issues, "manual");
+		if (!this.loaded || run.status === "cancelled") {
+			return run;
+		}
 		await this.reconcilePostRestartEvidence(run, true);
+		if (!this.loaded) {
+			return run;
+		}
 		await this.removeVerifiedSuccessfulRepairs();
 		return run;
 	}
@@ -281,13 +290,25 @@ export default class SyncAssetsPlugin extends Plugin {
 			return null;
 		}
 		const run = await this.coordinator.run(state.settings, state.issues, "startup");
+		if (!this.loaded || run.status === "cancelled") {
+			return run;
+		}
 		await this.handleAutomaticRun(run);
 		return run;
 	}
 
 	private async handleAutomaticRun(run: IntegrityCheckRun): Promise<void> {
+		if (!this.loaded || run.status === "cancelled") {
+			return;
+		}
 		await this.reconcilePostRestartEvidence(run, false);
+		if (!this.loaded) {
+			return;
+		}
 		await this.removeVerifiedSuccessfulRepairs();
+		if (!this.loaded) {
+			return;
+		}
 		const disposition = buildStartupRunDisposition(run);
 		if (disposition.disposition === "none") {
 			return;
