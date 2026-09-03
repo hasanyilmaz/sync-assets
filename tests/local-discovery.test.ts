@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import {
 	discoverLocalPlugins,
+	discoverMonitoredPlugins,
 	MAX_MANIFEST_BYTES,
 	type DiscoveryAdapter,
 	type LocalDiscoveryContext,
@@ -142,6 +143,42 @@ function setupPluginRoot(
 }
 
 describe("local plugin discovery", () => {
+	it("limits integrity discovery to monitored plugins without reading unmonitored manifests", async () => {
+		const adapter = new FakeDiscoveryAdapter();
+		const pluginRoot = ".custom-config/plugins";
+		setupPluginRoot(adapter, pluginRoot, ["broken-unmonitored", "operon"]);
+		installPlugin(adapter, pluginRoot, "broken-unmonitored");
+		installPlugin(adapter, pluginRoot, "operon");
+		adapter.nodes.delete(`${pluginRoot}/broken-unmonitored/manifest.json`);
+
+		const result = await discoverMonitoredPlugins(
+			createSettings([{ pluginId: "operon", owner: "hasanyilmaz", repo: "operon" }]),
+			createContext(adapter),
+		);
+
+		expect(result.status).toBe("completed");
+		expect(result.plugins.map(plugin => plugin.pluginId)).toEqual(["operon"]);
+		expect(adapter.calls).not.toContain(`list:${pluginRoot}`);
+		expect(adapter.calls.some(call => call.includes("broken-unmonitored"))).toBe(false);
+	});
+
+	it("reports a monitored plugin whose direct folder is missing", async () => {
+		const adapter = new FakeDiscoveryAdapter();
+		setupPluginRoot(adapter, ".custom-config/plugins", ["unmonitored"]);
+		installPlugin(adapter, ".custom-config/plugins", "unmonitored");
+
+		const result = await discoverMonitoredPlugins(
+			createSettings([{ pluginId: "operon", owner: "hasanyilmaz", repo: "operon" }]),
+			createContext(adapter),
+		);
+
+		expect(result.plugins).toEqual([expect.objectContaining({
+			status: "configured-missing",
+			pluginId: "operon",
+		})]);
+		expect(adapter.calls.some(call => call.includes("unmonitored/manifest.json"))).toBe(false);
+	});
+
 	it("uses the supplied config directory, discovers all plugins, and sorts them", async () => {
 		const adapter = new FakeDiscoveryAdapter();
 		const pluginRoot = ".custom-config/plugins";

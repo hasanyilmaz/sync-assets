@@ -285,6 +285,50 @@ function buildFixtureRun(): IntegrityCheckRun {
 }
 
 describe("check presentation", () => {
+	it("keeps an unmonitored local discovery error out of attention results", () => {
+		const run = buildFixtureRun();
+		const broken = {
+			status: "error" as const,
+			pluginId: "broken-unmonitored",
+			pluginPath: ".obsidian/plugins/broken-unmonitored",
+			repository: null,
+			manifest: null,
+			artifacts: [] as const,
+			reason: { code: "manifest-read-error", message: "Could not read manifest." },
+		};
+		const skippedBroken = skipped(broken, "local-error");
+		const presentation = buildCheckPresentation({
+			...run,
+			discovery: {
+				...run.discovery!,
+				plugins: [...run.discovery!.plugins, broken],
+			},
+			remote: {
+				...run.remote!,
+				records: [...run.remote!.records, skippedBroken],
+			},
+			verification: {
+				...run.verification!,
+				records: [...run.verification!.records, {
+					outcome: "blocked" as const,
+					pluginId: broken.pluginId,
+					repository: null,
+					manifestVersion: null,
+					status: "error" as const,
+					sourceRemoteStatus: "skipped" as const,
+					result: null,
+					reason: skippedBroken.reason,
+					retryAtMs: null,
+				}],
+			},
+		});
+
+		expect(presentation.groups.find(group => group.id === "needs-attention")?.plugins)
+			.not.toEqual(expect.arrayContaining([expect.objectContaining({ pluginId: broken.pluginId })]));
+		expect(presentation.groups.find(group => group.id === "not-configured")?.plugins)
+			.toEqual(expect.arrayContaining([expect.objectContaining({ pluginId: broken.pluginId })]));
+	});
+
 	it("groups every result class in fixed order and sorts plugin IDs within groups", () => {
 		const presentation = buildCheckPresentation(buildFixtureRun());
 

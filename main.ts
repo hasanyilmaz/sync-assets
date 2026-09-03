@@ -16,6 +16,7 @@ import {
 } from "./src/integrity-verification";
 import {
 	discoverLocalPlugins,
+	discoverMonitoredPlugins,
 	type LocalDiscoveryResult,
 } from "./src/local-discovery";
 import { probeMonitoredLocalAssets } from "./src/local-follow-up-probe";
@@ -95,12 +96,18 @@ export default class SyncAssetsPlugin extends Plugin {
 		}
 
 		const http = createRemoteHttpClient(request => requestUrl(request));
-		const discover = (settings: SyncAssetsSettings): Promise<LocalDiscoveryResult> => discoverLocalPlugins(settings, {
+		const discoveryContext = {
 			adapter: this.app.vault.adapter,
 			configDir: this.app.vault.configDir,
 			ownPluginId: this.manifest.id,
 			normalizePath,
-		});
+		};
+		const discover = (settings: SyncAssetsSettings): Promise<LocalDiscoveryResult> => (
+			discoverMonitoredPlugins(settings, discoveryContext)
+		);
+		const discoverInventory = (settings: SyncAssetsSettings): Promise<LocalDiscoveryResult> => (
+			discoverLocalPlugins(settings, discoveryContext)
+		);
 		this.coordinator = new IntegrityCheckCoordinator({
 			discover,
 			resolve: (discovery: LocalDiscoveryResult): Promise<RemoteResolutionBatch> => resolveRemoteReleases(discovery, { http }),
@@ -171,7 +178,7 @@ export default class SyncAssetsPlugin extends Plugin {
 			settings => {
 				this.settings = settings;
 			},
-			() => discover(this.settingsController?.getState().settings ?? createDefaultSettings()),
+			() => discoverInventory(this.settingsController?.getState().settings ?? createDefaultSettings()),
 			catalogSession,
 			this.journal,
 		);

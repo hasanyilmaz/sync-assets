@@ -140,6 +140,9 @@ function classifyGroup(
 	if (plugin.status === "configured-missing") {
 		return "configured-missing";
 	}
+	if (plugin.repository === null) {
+		return "not-configured";
+	}
 	if (
 		remote?.status === "skipped"
 		&& remote.reason.code === "repository-not-configured"

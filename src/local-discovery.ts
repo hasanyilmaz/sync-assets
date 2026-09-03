@@ -389,61 +389,183 @@ export async function discoverLocalPlugins(
 	const plugins: LocalPluginRecord[] = [];
 
 	for (const folderName of [...folderNames].sort((left, right) => left.localeCompare(right))) {
-		const pluginPath = context.normalizePath(`${pluginRoot}/${folderName}`);
-		const manifestPath = context.normalizePath(`${pluginPath}/manifest.json`);
-		const repository = repositoryByPluginId.get(folderName) ?? null;
-		const manifestResult = await readManifest(context.adapter, manifestPath, folderName);
-
-		if (!manifestResult.ok) {
-			issues.push(issue("plugin", manifestPath, folderName, manifestResult.reason));
-			plugins.push({
-				status: manifestResult.status,
-				pluginId: folderName,
-				pluginPath,
-				repository,
-				manifest: null,
-				artifacts: [],
-				reason: manifestResult.reason,
-			});
-			continue;
-		}
-
-		const artifacts: LocalArtifactSnapshot[] = [];
-		for (const assetName of RELEASE_ASSET_NAMES) {
-			if (assetName === "manifest.json") {
-				artifacts.push({
-					assetName,
-					path: manifestPath,
-					state: "file",
-					sizeBytes: manifestResult.stat.size,
-					reason: null,
-				});
-				continue;
-			}
-
-			const artifactPath = context.normalizePath(`${pluginPath}/${assetName}`);
-			artifacts.push(await inspectArtifact(
-				context.adapter,
-				artifactPath,
-				folderName,
-				assetName,
-				issues,
-			));
-		}
-
-		plugins.push({
-			status: "discovered",
-			pluginId: folderName,
-			pluginPath,
-			repository,
-			manifest: manifestResult.manifest,
-			artifacts,
-			reason: null,
-		});
+		plugins.push(await inspectPluginFolder(
+			pluginRoot,
+			folderName,
+			repositoryByPluginId.get(folderName) ?? null,
+			context,
+			issues,
+		));
 	}
 
 	plugins.push(...configuredMissingRecords(pluginRoot, settings, installedPluginIds, context));
 	plugins.sort((left, right) => left.pluginId.localeCompare(right.pluginId));
+
+	return { status: "completed", pluginRoot, plugins, issues };
+}
+
+async function inspectPluginFolder(
+	pluginRoot: string,
+	pluginId: string,
+	repository: GitHubRepository | null,
+	context: LocalDiscoveryContext,
+	issues: DiscoveryIssue[],
+): Promise<LocalPluginRecord> {
+	const pluginPath = context.normalizePath(`${pluginRoot}/${pluginId}`);
+	const manifestPath = context.normalizePath(`${pluginPath}/manifest.json`);
+	const manifestResult = await readManifest(context.adapter, manifestPath, pluginId);
+
+	if (!manifestResult.ok) {
+		issues.push(issue("plugin", manifestPath, pluginId, manifestResult.reason));
+		return {
+			status: manifestResult.status,
+			pluginId,
+			pluginPath,
+			repository,
+			manifest: null,
+			artifacts: [],
+			reason: manifestResult.reason,
+		};
+	}
+
+	const artifacts: LocalArtifactSnapshot[] = [];
+	for (const assetName of RELEASE_ASSET_NAMES) {
+		if (assetName === "manifest.json") {
+			artifacts.push({
+				assetName,
+				path: manifestPath,
+				state: "file",
+				sizeBytes: manifestResult.stat.size,
+				reason: null,
+			});
+			continue;
+		}
+
+		const artifactPath = context.normalizePath(`${pluginPath}/${assetName}`);
+		artifacts.push(await inspectArtifact(
+			context.adapter,
+			artifactPath,
+			pluginId,
+			assetName,
+			issues,
+		));
+	}
+
+	return {
+		status: "discovered",
+		pluginId,
+		pluginPath,
+		repository,
+		manifest: manifestResult.manifest,
+		artifacts,
+		reason: null,
+	};
+}
+
+export async function discoverMonitoredPlugins(
+	settings: SyncAssetsSettings,
+	context: LocalDiscoveryContext,
+): Promise<LocalDiscoveryResult> {
+	const pluginRoot = context.normalizePath(`${context.configDir}/plugins`);
+	const issues: DiscoveryIssue[] = [];
+	const ownPluginIdResult = validatePluginId(context.ownPluginId, "ownPluginId");
+	if (!ownPluginIdResult.ok) {
+		const problem = reason("invalid-own-plugin-id", "Sync Assets plugin ID is not path-safe.");
+		return {
+			status: "error",
+			pluginRoot,
+			plugins: [],
+			issues: [issue("scan", pluginRoot, null, problem)],
+		};
+	}
+
+	let pluginRootStat: Stat | null;
+	try {
+		pluginRootStat = await context.adapter.stat(pluginRoot);
+	} catch (error) {
+		const problem = reason("plugin-root-stat-error", `Could not inspect plugin root: ${getErrorMessage(error)}`);
+		return {
+			status: "error",
+			pluginRoot,
+			plugins: [],
+			issues: [issue("scan", pluginRoot, null, problem)],
+		};
+	}
+
+	if (pluginRootStat === null) {
+		return {
+			status: "completed",
+			pluginRoot,
+			plugins: configuredMissingRecords(pluginRoot, settings, new Set(), context),
+			issues,
+		};
+	}
+	if (pluginRootStat.type !== "folder") {
+		const problem = reason("plugin-root-not-folder", "Configured plugin root is not a folder.");
+		return {
+			status: "error",
+			pluginRoot,
+			plugins: [],
+			issues: [issue("scan", pluginRoot, null, problem)],
+		};
+	}
+
+	const plugins: LocalPluginRecord[] = [];
+	for (const mapping of [...settings.repositories].sort((left, right) => (
+		left.pluginId.localeCompare(right.pluginId)
+	))) {
+		if (mapping.pluginId === ownPluginIdResult.value) {
+			continue;
+		}
+		const pluginPath = context.normalizePath(`${pluginRoot}/${mapping.pluginId}`);
+		let pluginStat: Stat | null;
+		try {
+			pluginStat = await context.adapter.stat(pluginPath);
+		} catch (error) {
+			const problem = reason("plugin-folder-stat-error", `Could not inspect plugin folder: ${getErrorMessage(error)}`);
+			issues.push(issue("plugin", pluginPath, mapping.pluginId, problem));
+			plugins.push({
+				status: "error",
+				pluginId: mapping.pluginId,
+				pluginPath,
+				repository: mapping.repository,
+				manifest: null,
+				artifacts: [],
+				reason: problem,
+			});
+			continue;
+		}
+		if (pluginStat === null) {
+			plugins.push(configuredMissingRecord(
+				pluginRoot,
+				mapping.pluginId,
+				mapping.repository,
+				context.normalizePath,
+			));
+			continue;
+		}
+		if (pluginStat.type !== "folder") {
+			const problem = reason("plugin-path-not-folder", "Configured plugin path is not a folder.");
+			issues.push(issue("plugin", pluginPath, mapping.pluginId, problem));
+			plugins.push({
+				status: "unverifiable",
+				pluginId: mapping.pluginId,
+				pluginPath,
+				repository: mapping.repository,
+				manifest: null,
+				artifacts: [],
+				reason: problem,
+			});
+			continue;
+		}
+		plugins.push(await inspectPluginFolder(
+			pluginRoot,
+			mapping.pluginId,
+			mapping.repository,
+			context,
+			issues,
+		));
+	}
 
 	return { status: "completed", pluginRoot, plugins, issues };
 }
