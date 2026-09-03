@@ -165,4 +165,62 @@ describe("integrity check coordinator", () => {
 		expect(run.status).toBe("failed");
 		expect(run.reason?.code).toBe("correlation-error");
 	});
+
+	it("discards a late stage completion after disposal without publishing state", async () => {
+		let finishDiscovery!: (value: LocalDiscoveryResult) => void;
+		let resolveCalls = 0;
+		const coordinator = new IntegrityCheckCoordinator({
+			discover: (): Promise<LocalDiscoveryResult> => new Promise(resolve => {
+				finishDiscovery = resolve;
+			}),
+			resolve: (): Promise<RemoteResolutionBatch> => {
+				resolveCalls += 1;
+				return Promise.resolve(REMOTE);
+			},
+			verify: (): Promise<IntegrityVerificationBatch> => Promise.resolve(VERIFICATION),
+		});
+		const snapshots: string[] = [];
+		coordinator.subscribe(snapshot => {
+			snapshots.push(`${snapshot.phase}:${snapshot.latestRun?.status ?? "none"}`);
+		});
+
+		const pending = coordinator.run(createDefaultSettings());
+		await Promise.resolve();
+		coordinator.dispose();
+		finishDiscovery(DISCOVERY);
+		const run = await pending;
+
+		expect(run.status).toBe("cancelled");
+		expect(run.reason?.code).toBe("integrity-check-cancelled");
+		expect(resolveCalls).toBe(0);
+		expect(coordinator.getSnapshot()).toEqual({
+			phase: "idle",
+			activeRunId: null,
+			latestRun: null,
+			progressLabel: null,
+		});
+		expect(snapshots.at(-1)).toBe("discovering:none");
+	});
+
+	it("publishes active plugin and file progress only during verification", async () => {
+		const labels: Array<string | null> = [];
+		const coordinator = new IntegrityCheckCoordinator({
+			discover: (): Promise<LocalDiscoveryResult> => Promise.resolve(DISCOVERY),
+			resolve: (): Promise<RemoteResolutionBatch> => Promise.resolve(REMOTE),
+			verify: (_discovery, _remote, reportProgress): Promise<IntegrityVerificationBatch> => {
+				reportProgress("Verifying operon: main.js…");
+				reportProgress("Verifying operon: manifest.json…");
+				return Promise.resolve(VERIFICATION);
+			},
+		});
+		coordinator.subscribe(snapshot => {
+			labels.push(snapshot.progressLabel);
+		});
+
+		await coordinator.run(createDefaultSettings());
+
+		expect(labels).toContain("Verifying operon: main.js…");
+		expect(labels).toContain("Verifying operon: manifest.json…");
+		expect(coordinator.getSnapshot().progressLabel).toBeNull();
+	});
 });

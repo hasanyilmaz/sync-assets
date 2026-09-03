@@ -16,6 +16,7 @@ import {
 } from "./src/integrity-verification";
 import {
 	discoverLocalPlugins,
+	discoverMonitoredPlugins,
 	type LocalDiscoveryResult,
 } from "./src/local-discovery";
 import { probeMonitoredLocalAssets } from "./src/local-follow-up-probe";
@@ -53,7 +54,7 @@ import {
 	type SyncAssetsSettings,
 } from "./src/settings";
 import {
-	buildStartupAttentionSummary,
+	buildStartupRunDisposition,
 	StartupCheckController,
 } from "./src/startup-check";
 import { StartupLocalFollowUpController } from "./src/startup-local-follow-up";
@@ -79,6 +80,7 @@ export default class SyncAssetsPlugin extends Plugin {
 	private startupController: StartupCheckController | null = null;
 	private startupFollowUpController: StartupLocalFollowUpController | null = null;
 	private loaded = false;
+	private availabilityNoticeShown = false;
 	private readonly sessionId = createSessionId();
 
 	async onload(): Promise<void> {
@@ -88,39 +90,54 @@ export default class SyncAssetsPlugin extends Plugin {
 		});
 		this.settingsController = new SettingsController(persistence);
 		const settingsState = await this.settingsController.load();
-		const startupSettingsState = this.settingsController.getState();
+		const initialSettingsState = this.settingsController.getState();
 		this.settings = settingsState.settings;
 		if (settingsState.issues.length > 0) {
 			new Notice("Sync Assets settings are invalid. Safe defaults are active; open the plugin settings for details.", 0);
 		}
 
 		const http = createRemoteHttpClient(request => requestUrl(request));
-		const discover = (settings: SyncAssetsSettings): Promise<LocalDiscoveryResult> => discoverLocalPlugins(settings, {
+		const discoveryContext = {
 			adapter: this.app.vault.adapter,
 			configDir: this.app.vault.configDir,
 			ownPluginId: this.manifest.id,
 			normalizePath,
-		});
+		};
+		const discover = (settings: SyncAssetsSettings): Promise<LocalDiscoveryResult> => (
+			discoverMonitoredPlugins(settings, discoveryContext)
+		);
+		const discoverInventory = (settings: SyncAssetsSettings): Promise<LocalDiscoveryResult> => (
+			discoverLocalPlugins(settings, discoveryContext)
+		);
 		this.coordinator = new IntegrityCheckCoordinator({
 			discover,
 			resolve: (discovery: LocalDiscoveryResult): Promise<RemoteResolutionBatch> => resolveRemoteReleases(discovery, { http }),
 			verify: (
 				discovery: LocalDiscoveryResult,
 				remote: RemoteResolutionBatch,
+				reportProgress: (label: string) => void,
 			): Promise<IntegrityVerificationBatch> => verifyPluginIntegrity(
 				discovery,
 				remote,
-				{ adapter: this.app.vault.adapter },
+				{
+					adapter: this.app.vault.adapter,
+					yieldToHost: () => new Promise(resolve => {
+						window.setTimeout(resolve, 0);
+					}),
+					onProgress: progress => {
+						reportProgress(`Verifying ${progress.pluginId}: ${progress.assetName}…`);
+					},
+				},
 			),
 		});
 		this.startupController = new StartupCheckController(
 			this.coordinator,
-			() => startupSettingsState,
+			() => this.settingsController?.getState() ?? initialSettingsState,
 		);
 		this.startupFollowUpController = new StartupLocalFollowUpController({
-			getSettingsState: (): SettingsState => this.settingsController?.getState() ?? startupSettingsState,
+			getSettingsState: (): SettingsState => this.settingsController?.getState() ?? initialSettingsState,
 			probe: (): Promise<string | null> => probeMonitoredLocalAssets(
-				(this.settingsController?.getState() ?? startupSettingsState).settings,
+				(this.settingsController?.getState() ?? initialSettingsState).settings,
 				{
 					adapter: this.app.vault.adapter,
 					configDir: this.app.vault.configDir,
@@ -170,8 +187,9 @@ export default class SyncAssetsPlugin extends Plugin {
 			this.settingsController,
 			settings => {
 				this.settings = settings;
+				this.startupFollowUpController?.notifySettingsChanged();
 			},
-			() => discover(this.settingsController?.getState().settings ?? createDefaultSettings()),
+			() => discoverInventory(this.settingsController?.getState().settings ?? createDefaultSettings()),
 			catalogSession,
 			this.journal,
 		);
@@ -208,6 +226,7 @@ export default class SyncAssetsPlugin extends Plugin {
 	onunload(): void {
 		this.loaded = false;
 		this.startupFollowUpController?.stop();
+		this.coordinator?.dispose();
 		this.resultsModal?.close();
 	}
 
@@ -218,6 +237,7 @@ export default class SyncAssetsPlugin extends Plugin {
 		const state = await this.settingsController.load();
 		this.settings = state.settings;
 		this.settingTab?.reloadFromController();
+		this.startupFollowUpController?.notifySettingsChanged();
 		if (state.issues.length > 0) {
 			new Notice("Sync Assets settings are invalid. Safe defaults are active; open the plugin settings for details.", 0);
 		}
@@ -234,7 +254,13 @@ export default class SyncAssetsPlugin extends Plugin {
 		}
 		const state = this.settingsController.getState();
 		const run = await this.coordinator.run(state.settings, state.issues, "manual");
+		if (!this.loaded || run.status === "cancelled") {
+			return run;
+		}
 		await this.reconcilePostRestartEvidence(run, true);
+		if (!this.loaded) {
+			return run;
+		}
 		await this.removeVerifiedSuccessfulRepairs();
 		return run;
 	}
@@ -273,15 +299,34 @@ export default class SyncAssetsPlugin extends Plugin {
 			return null;
 		}
 		const run = await this.coordinator.run(state.settings, state.issues, "startup");
+		if (!this.loaded || run.status === "cancelled") {
+			return run;
+		}
 		await this.handleAutomaticRun(run);
 		return run;
 	}
 
 	private async handleAutomaticRun(run: IntegrityCheckRun): Promise<void> {
+		if (!this.loaded || run.status === "cancelled") {
+			return;
+		}
 		await this.reconcilePostRestartEvidence(run, false);
+		if (!this.loaded) {
+			return;
+		}
 		await this.removeVerifiedSuccessfulRepairs();
-		const summary = buildStartupAttentionSummary(run);
-		if (summary === null) {
+		if (!this.loaded) {
+			return;
+		}
+		const disposition = buildStartupRunDisposition(run);
+		if (disposition.disposition === "none") {
+			return;
+		}
+		if (disposition.disposition === "notice") {
+			if (!this.availabilityNoticeShown) {
+				this.availabilityNoticeShown = true;
+				new Notice(disposition.message);
+			}
 			return;
 		}
 		this.resultsModal?.open();

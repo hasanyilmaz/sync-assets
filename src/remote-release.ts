@@ -21,6 +21,20 @@ import {
 
 export const GITHUB_API_VERSION = "2026-03-10";
 export const MAX_RELEASE_RESPONSE_BYTES = 2 * 1024 * 1024;
+export const REMOTE_REQUEST_ATTEMPT_TIMEOUT_MS = 8_000;
+export const REMOTE_REQUEST_TOTAL_BUDGET_MS = 30_000;
+export const REMOTE_REQUEST_RETRY_DELAYS_MS = [3_000, 8_000] as const;
+
+export const REMOTE_FAILURE_KINDS = [
+	"connection",
+	"timeout",
+	"temporary-server",
+	"rate-limit",
+	"unsupported-response",
+	"unexpected",
+] as const;
+
+export type RemoteFailureKind = (typeof REMOTE_FAILURE_KINDS)[number];
 
 export interface RemoteHttpRequest {
 	readonly url: string;
@@ -43,6 +57,8 @@ export type RemoteHttpClient = (
 export interface RemoteResolverContext {
 	readonly http: RemoteHttpClient;
 	readonly now?: () => number;
+	readonly sleep?: (delayMs: number) => Promise<void>;
+	readonly runWithTimeout?: <T>(operation: () => Promise<T>, timeoutMs: number) => Promise<T>;
 }
 
 export interface RateLimitSnapshot {
@@ -94,6 +110,8 @@ export interface UnresolvedRemoteRecord extends RemoteResolutionRecordBase {
 	readonly release: null;
 	readonly reason: IntegrityReason;
 	readonly retryAtMs: number | null;
+	readonly failureKind?: RemoteFailureKind;
+	readonly technicalMessage?: string | null;
 }
 
 export interface SkippedRemoteRecord extends RemoteResolutionRecordBase {
@@ -121,6 +139,24 @@ interface ResolverState {
 	rateLimit: RateLimitSnapshot | null;
 	rateLimitExhausted: boolean;
 	retryAtMs: number | null;
+	availabilityFailure: AvailabilityFailure | null;
+}
+
+interface AvailabilityFailure {
+	readonly kind: "connection" | "timeout" | "temporary-server";
+	readonly reason: IntegrityReason;
+	readonly technicalMessage: string | null;
+}
+
+type RemoteRequestAttemptResult =
+	| { readonly ok: true; readonly response: RemoteHttpResponse }
+	| { readonly ok: false; readonly failure: AvailabilityFailure };
+
+export class RemoteRequestTimeoutError extends Error {
+	constructor() {
+		super("The remote request exceeded its time limit.");
+		this.name = "RemoteRequestTimeoutError";
+	}
 }
 
 interface ReleaseMetadata {
@@ -149,6 +185,8 @@ type ManifestDownloadResult =
 		readonly ok: false;
 		readonly status: "unverifiable" | "error";
 		readonly reason: IntegrityReason;
+		readonly failureKind?: RemoteFailureKind;
+		readonly technicalMessage?: string | null;
 	};
 
 function reason(code: string, message: string): IntegrityReason {
@@ -161,6 +199,109 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function getErrorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : "Unknown network error.";
+}
+
+function defaultSleep(delayMs: number): Promise<void> {
+	return new Promise(resolve => {
+		window.setTimeout(resolve, delayMs);
+	});
+}
+
+function defaultRunWithTimeout<T>(
+	operation: () => Promise<T>,
+	timeoutMs: number,
+): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		const timeoutId = window.setTimeout(() => {
+			reject(new RemoteRequestTimeoutError());
+		}, timeoutMs);
+		void operation().then(resolve, reject).finally(() => {
+			window.clearTimeout(timeoutId);
+		});
+	});
+}
+
+function availabilityFailure(
+	kind: AvailabilityFailure["kind"],
+	technicalMessage: string | null,
+): AvailabilityFailure {
+	if (kind === "timeout") {
+		return {
+			kind,
+			reason: reason(
+				"github-request-timeout",
+				"GitHub did not respond in time, so this plugin was not checked. Try again when your connection is stable.",
+			),
+			technicalMessage,
+		};
+	}
+	if (kind === "temporary-server") {
+		return {
+			kind,
+			reason: reason(
+				"github-temporary-server-error",
+				"GitHub is temporarily unavailable, so this plugin was not checked. Try again later.",
+			),
+			technicalMessage,
+		};
+	}
+	return {
+		kind,
+		reason: reason(
+			"github-connection-unavailable",
+			"Sync Assets couldn't reach GitHub, so this plugin was not checked. Check your internet connection, VPN, or Private DNS, then try again.",
+		),
+		technicalMessage,
+	};
+}
+
+function isRetryableHttpStatus(status: number): boolean {
+	return [408, 425, 500, 502, 503, 504].includes(status);
+}
+
+async function requestWithRetry(
+	request: RemoteHttpRequest,
+	context: RemoteResolverContext,
+	state: ResolverState,
+): Promise<RemoteRequestAttemptResult> {
+	const now = context.now ?? Date.now;
+	const sleep = context.sleep ?? defaultSleep;
+	const runWithTimeout = context.runWithTimeout ?? defaultRunWithTimeout;
+	const deadlineMs = now() + REMOTE_REQUEST_TOTAL_BUDGET_MS;
+	let latestFailure = availabilityFailure("connection", null);
+
+	for (let attempt = 0; attempt <= REMOTE_REQUEST_RETRY_DELAYS_MS.length; attempt += 1) {
+		const remainingMs = deadlineMs - now();
+		if (remainingMs <= 0) {
+			return { ok: false, failure: latestFailure };
+		}
+		state.requestCount += 1;
+		try {
+			const response = await runWithTimeout(
+				() => context.http(request),
+				Math.min(REMOTE_REQUEST_ATTEMPT_TIMEOUT_MS, remainingMs),
+			);
+			if (!isRetryableHttpStatus(response.status)) {
+				return { ok: true, response };
+			}
+			latestFailure = availabilityFailure(
+				"temporary-server",
+				`GitHub request returned HTTP ${response.status}.`,
+			);
+		} catch (error) {
+			latestFailure = error instanceof RemoteRequestTimeoutError
+				? availabilityFailure("timeout", getErrorMessage(error))
+				: availabilityFailure("connection", getErrorMessage(error));
+		}
+
+		const delayMs = REMOTE_REQUEST_RETRY_DELAYS_MS[attempt];
+		if (delayMs === undefined || now() + delayMs >= deadlineMs) {
+			return { ok: false, failure: latestFailure };
+		}
+		await sleep(delayMs);
+	}
+
+	return { ok: false, failure: latestFailure };
 }
 
 function getHeader(
@@ -489,17 +630,22 @@ async function downloadRemoteManifest(
 		};
 	}
 
-	let response: RemoteHttpResponse;
-	state.requestCount += 1;
-	try {
-		response = await context.http(assetRequest(manifestAsset.downloadUrl));
-	} catch (error) {
+	const attempted = await requestWithRetry(
+		assetRequest(manifestAsset.downloadUrl),
+		context,
+		state,
+	);
+	if (!attempted.ok) {
+		state.availabilityFailure = attempted.failure;
 		return {
 			ok: false,
 			status: "error",
-			reason: reason("remote-manifest-request-error", `Could not download remote manifest: ${getErrorMessage(error)}`),
+			reason: attempted.failure.reason,
+			failureKind: attempted.failure.kind,
+			technicalMessage: attempted.failure.technicalMessage,
 		};
 	}
+	const { response } = attempted;
 
 	if (response.status !== 200) {
 		return {
@@ -586,6 +732,27 @@ function deferredRecord(
 		release: null,
 		reason: reason("github-rate-limit-exhausted", "GitHub rate limit is exhausted; no automatic retry was scheduled."),
 		retryAtMs: state.retryAtMs,
+		failureKind: "rate-limit",
+		technicalMessage: null,
+	};
+}
+
+function availabilityDeferredRecord(
+	target: DiscoveredPluginRecord & { readonly repository: GitHubRepository },
+	state: ResolverState,
+): UnresolvedRemoteRecord {
+	const failure = state.availabilityFailure;
+	if (failure === null) {
+		throw new Error("Availability circuit breaker has no failure.");
+	}
+	return {
+		...recordBase(target, state, 0),
+		status: "deferred",
+		release: null,
+		reason: failure.reason,
+		retryAtMs: null,
+		failureKind: failure.kind,
+		technicalMessage: failure.technicalMessage,
 	};
 }
 
@@ -607,19 +774,24 @@ async function resolveTarget(
 	}
 
 	for (const [candidateIndex, tagName] of candidatesResult.value.entries()) {
-		let response: RemoteHttpResponse;
-		state.requestCount += 1;
-		try {
-			response = await context.http(apiRequest(target.repository, tagName));
-		} catch (error) {
+		const attempted = await requestWithRetry(
+			apiRequest(target.repository, tagName),
+			context,
+			state,
+		);
+		if (!attempted.ok) {
+			state.availabilityFailure = attempted.failure;
 			return {
 				...recordBase(target, state, state.requestCount - startRequestCount),
 				status: "error",
 				release: null,
-				reason: reason("github-request-error", `GitHub request failed: ${getErrorMessage(error)}`),
+				reason: attempted.failure.reason,
 				retryAtMs: null,
+				failureKind: attempted.failure.kind,
+				technicalMessage: attempted.failure.technicalMessage,
 			};
 		}
+		const { response } = attempted;
 
 		const snapshot = updateRateLimitState(
 			state,
@@ -663,6 +835,8 @@ async function resolveTarget(
 				release: null,
 				reason: reason("github-http-error", `GitHub release request returned HTTP ${response.status}.`),
 				retryAtMs: null,
+				failureKind: "unexpected",
+				technicalMessage: `GitHub request returned HTTP ${response.status}.`,
 			};
 		}
 
@@ -674,6 +848,8 @@ async function resolveTarget(
 				release: null,
 				reason: parsedResponse.reason,
 				retryAtMs: null,
+				failureKind: "unsupported-response",
+				technicalMessage: null,
 			};
 		}
 
@@ -689,6 +865,8 @@ async function resolveTarget(
 				release: null,
 				reason: metadataResult.reason,
 				retryAtMs: null,
+				failureKind: "unsupported-response",
+				technicalMessage: null,
 			};
 		}
 
@@ -705,6 +883,8 @@ async function resolveTarget(
 				release: null,
 				reason: manifestResult.reason,
 				retryAtMs: null,
+				failureKind: manifestResult.failureKind ?? "unsupported-response",
+				technicalMessage: manifestResult.technicalMessage ?? null,
 			};
 		}
 
@@ -776,6 +956,7 @@ export async function resolveRemoteReleases(
 		rateLimit: null,
 		rateLimitExhausted: false,
 		retryAtMs: null,
+		availabilityFailure: null,
 	};
 	const records: RemoteResolutionRecord[] = [];
 	const sortedPlugins = [...discovery.plugins]
@@ -784,6 +965,10 @@ export async function resolveRemoteReleases(
 	for (const plugin of sortedPlugins) {
 		if (!isEligibleTarget(plugin)) {
 			records.push(skippedRecord(plugin));
+			continue;
+		}
+		if (state.availabilityFailure !== null) {
+			records.push(availabilityDeferredRecord(plugin, state));
 			continue;
 		}
 		if (state.rateLimitExhausted) {

@@ -10,10 +10,12 @@ import type {
 import {
 	GITHUB_API_VERSION,
 	MAX_RELEASE_RESPONSE_BYTES,
+	REMOTE_REQUEST_ATTEMPT_TIMEOUT_MS,
+	RemoteRequestTimeoutError,
 	resolveRemoteReleases,
-	type RemoteHttpClient,
 	type RemoteHttpRequest,
 	type RemoteHttpResponse,
+	type RemoteResolverContext,
 } from "../src/remote-release";
 
 const VALID_DIGEST = `sha256:${"a".repeat(64)}`;
@@ -199,13 +201,12 @@ function discoveryResult(
 	};
 }
 
-function context(http: FakeRemoteHttp, now = 1_000_000): {
-	readonly http: RemoteHttpClient;
-	readonly now: () => number;
-} {
+function context(http: FakeRemoteHttp, now = 1_000_000): RemoteResolverContext {
 	return {
 		http: request => http.send(request),
 		now: () => now,
+		sleep: () => Promise.resolve(),
+		runWithTimeout: operation => operation(),
 	};
 }
 
@@ -534,7 +535,12 @@ describe("remote manifest trust", () => {
 		const httpError = new FakeRemoteHttp();
 		const httpFixture = createReleaseFixture("operon", "1.2.3");
 		httpError.enqueue(apiUrl(DEFAULT_REPOSITORY, "1.2.3"), jsonResponse(200, httpFixture.payload));
-		httpError.enqueue(httpFixture.manifestUrl, textResponse(503, ""));
+		httpError.enqueue(
+			httpFixture.manifestUrl,
+			textResponse(503, ""),
+			textResponse(503, ""),
+			textResponse(503, ""),
+		);
 		const httpResult = await resolveRemoteReleases(discoveryResult([plugin]), context(httpError));
 
 		const sizeError = new FakeRemoteHttp();
@@ -552,7 +558,11 @@ describe("remote manifest trust", () => {
 		);
 		const utf8Result = await resolveRemoteReleases(discoveryResult([plugin]), context(utf8Error));
 
-		expect(httpResult.records[0]?.reason?.code).toBe("remote-manifest-http-error");
+		expect(httpResult.records[0]?.reason?.code).toBe("github-temporary-server-error");
+		const httpRecord = httpResult.records[0];
+		if (httpRecord?.status === "error") {
+			expect(httpRecord.failureKind).toBe("temporary-server");
+		}
 		expect(sizeResult.records[0]?.reason?.code).toBe("remote-manifest-size-mismatch");
 		expect(utf8Result.records[0]?.reason?.code).toBe("remote-manifest-invalid-utf8");
 	});
@@ -622,15 +632,41 @@ describe("rate limits, failures, and sequential ordering", () => {
 		expect(http.calls).toHaveLength(1);
 	});
 
-	it.each([
-		{ name: "normal 403", response: textResponse(403, "{}"), code: "github-http-error" },
-		{ name: "server failure", response: textResponse(503, "{}"), code: "github-http-error" },
-		{ name: "transport failure", response: new Error("offline"), code: "github-request-error" },
-	])("isolates $name and continues with the next target", async ({ response, code }) => {
+	it("uses Retry-After for a rate-limited 403 without scheduling a retry", async () => {
+		const http = new FakeRemoteHttp();
+		http.enqueue(
+			apiUrl(DEFAULT_REPOSITORY, "1.2.3"),
+			textResponse(403, "{}", { "Retry-After": "45" }),
+		);
+
+		const result = await resolveRemoteReleases(
+			discoveryResult([discoveredPlugin("operon")]),
+			context(http, 1_000_000),
+		);
+
+		expect(result.records[0]?.status).toBe("deferred");
+		expect(result.records[0]?.retryAtMs).toBe(1_045_000);
+		expect(http.calls).toHaveLength(1);
+	});
+
+	it.each([400, 401, 418, 422])("does not retry HTTP %i", async status => {
+		const http = new FakeRemoteHttp();
+		http.enqueue(apiUrl(DEFAULT_REPOSITORY, "1.2.3"), textResponse(status, "{}"));
+
+		const result = await resolveRemoteReleases(
+			discoveryResult([discoveredPlugin("operon")]),
+			context(http),
+		);
+
+		expect(result.records[0]?.status).toBe("error");
+		expect(http.calls).toHaveLength(1);
+	});
+
+	it("does not retry a normal 403 and continues with the next target", async () => {
 		const http = new FakeRemoteHttp();
 		const alpha = discoveredPlugin("alpha");
 		const zeta = discoveredPlugin("zeta") as DiscoveredPluginRecord & { repository: GitHubRepository };
-		http.enqueue(apiUrl(DEFAULT_REPOSITORY, "1.2.3"), response);
+		http.enqueue(apiUrl(DEFAULT_REPOSITORY, "1.2.3"), textResponse(403, "{}"));
 		const fixture = createReleaseFixture("zeta", "1.2.3");
 		enqueueResolved(http, zeta, fixture);
 
@@ -644,7 +680,195 @@ describe("rate limits, failures, and sequential ordering", () => {
 			["alpha", "error"],
 			["zeta", "resolved"],
 		]);
+		expect(result.records[0]?.reason?.code).toBe("github-http-error");
+		expect(http.calls).toHaveLength(3);
+	});
+
+	it.each([
+		{
+			name: "server failure",
+			responses: [textResponse(503, "{}"), textResponse(503, "{}"), textResponse(503, "{}")],
+			code: "github-temporary-server-error",
+			kind: "temporary-server",
+		},
+		{
+			name: "transport failure",
+			responses: [new Error("offline"), new Error("offline"), new Error("offline")],
+			code: "github-connection-unavailable",
+			kind: "connection",
+		},
+	])("opens the batch circuit breaker after exhausted $name retries", async ({ responses, code, kind }) => {
+		const http = new FakeRemoteHttp();
+		http.enqueue(apiUrl(DEFAULT_REPOSITORY, "1.2.3"), ...responses);
+
+		const result = await resolveRemoteReleases(
+			discoveryResult([discoveredPlugin("zeta"), discoveredPlugin("alpha")]),
+			context(http),
+		);
+
+		expect(result.status).toBe("partial");
+		expect(result.records.map(record => [record.pluginId, record.status, record.requestCount])).toEqual([
+			["alpha", "error", 3],
+			["zeta", "deferred", 0],
+		]);
 		expect(result.records[0]?.reason?.code).toBe(code);
+		for (const record of result.records) {
+			if (record.status === "error" || record.status === "deferred") {
+				expect(record.failureKind).toBe(kind);
+			}
+		}
+		expect(http.calls).toHaveLength(3);
+	});
+
+	it.each([
+		"UnknownHostException: Unable to resolve host api.github.com",
+		"NSURLErrorDomain Code=-1009 The Internet connection appears to be offline.",
+	])("keeps platform transport text technical while returning a friendly reason", async platformMessage => {
+		const http = new FakeRemoteHttp();
+		http.enqueue(
+			apiUrl(DEFAULT_REPOSITORY, "1.2.3"),
+			new Error(platformMessage),
+			new Error(platformMessage),
+			new Error(platformMessage),
+		);
+
+		const result = await resolveRemoteReleases(
+			discoveryResult([discoveredPlugin("operon")]),
+			context(http),
+		);
+		const record = result.records[0];
+		if (record?.status !== "error") {
+			throw new Error("Expected a remote error record.");
+		}
+
+		expect(record.reason.message).toContain("couldn't reach GitHub");
+		expect(record.reason.message).not.toContain(platformMessage);
+		expect(record.technicalMessage).toBe(platformMessage);
+		expect(record.failureKind).toBe("connection");
+	});
+
+	it.each([408, 425, 500, 502, 503, 504])(
+		"retries HTTP %i and succeeds on the second attempt",
+		async status => {
+			const http = new FakeRemoteHttp();
+			const plugin = discoveredPlugin("operon") as DiscoveredPluginRecord & { repository: GitHubRepository };
+			const fixture = createReleaseFixture("operon", "1.2.3");
+			http.enqueue(
+				apiUrl(DEFAULT_REPOSITORY, "1.2.3"),
+				textResponse(status, "{}"),
+				jsonResponse(200, fixture.payload),
+			);
+			http.enqueue(
+				fixture.manifestUrl,
+				textResponse(200, fixture.manifestText, {}, toArrayBuffer(fixture.manifestText)),
+			);
+			const delays: number[] = [];
+
+			const result = await resolveRemoteReleases(discoveryResult([plugin]), {
+				...context(http),
+				sleep: delayMs => {
+					delays.push(delayMs);
+					return Promise.resolve();
+				},
+			});
+
+			expect(result.records[0]?.status).toBe("resolved");
+			expect(delays).toEqual([3_000]);
+			expect(http.calls).toHaveLength(3);
+		},
+	);
+
+	it("uses the third attempt after the 3 and 8 second retry delays", async () => {
+		const http = new FakeRemoteHttp();
+		const plugin = discoveredPlugin("operon") as DiscoveredPluginRecord & { repository: GitHubRepository };
+		const fixture = createReleaseFixture("operon", "1.2.3");
+		http.enqueue(
+			apiUrl(DEFAULT_REPOSITORY, "1.2.3"),
+			new Error("offline"),
+			new Error("offline"),
+			jsonResponse(200, fixture.payload),
+		);
+		http.enqueue(
+			fixture.manifestUrl,
+			textResponse(200, fixture.manifestText, {}, toArrayBuffer(fixture.manifestText)),
+		);
+		const delays: number[] = [];
+
+		const result = await resolveRemoteReleases(discoveryResult([plugin]), {
+			...context(http),
+			sleep: delayMs => {
+				delays.push(delayMs);
+				return Promise.resolve();
+			},
+		});
+
+		expect(result.records[0]?.status).toBe("resolved");
+		expect(delays).toEqual([3_000, 8_000]);
+	});
+
+	it("caps each attempt at eight seconds and the logical GET at thirty seconds", async () => {
+		const http = new FakeRemoteHttp();
+		let nowMs = 1_000_000;
+		const timeouts: number[] = [];
+		const delays: number[] = [];
+
+		const result = await resolveRemoteReleases(
+			discoveryResult([discoveredPlugin("operon")]),
+			{
+				http: request => http.send(request),
+				now: () => nowMs,
+				sleep: delayMs => {
+					delays.push(delayMs);
+					nowMs += delayMs;
+					return Promise.resolve();
+				},
+				runWithTimeout: <T>(_operation: () => Promise<T>, timeoutMs: number): Promise<T> => {
+					timeouts.push(timeoutMs);
+					nowMs += timeoutMs;
+					return Promise.reject(new RemoteRequestTimeoutError());
+				},
+			},
+		);
+
+		expect(timeouts).toEqual([
+			REMOTE_REQUEST_ATTEMPT_TIMEOUT_MS,
+			REMOTE_REQUEST_ATTEMPT_TIMEOUT_MS,
+			3_000,
+		]);
+		expect(delays).toEqual([3_000, 8_000]);
+		expect(nowMs).toBe(1_030_000);
+		const record = result.records[0];
+		if (record?.status === "error") {
+			expect(record.failureKind).toBe("timeout");
+		}
+		expect(result.records[0]?.reason?.code).toBe("github-request-timeout");
+	});
+
+	it("ignores native HTTP completions that arrive after all attempt timeouts", async () => {
+		const completions: Array<(response: RemoteHttpResponse) => void> = [];
+		const result = await resolveRemoteReleases(
+			discoveryResult([discoveredPlugin("operon")]),
+			{
+				http: () => new Promise(resolve => {
+					completions.push(resolve);
+				}),
+				now: () => 1_000_000,
+				sleep: () => Promise.resolve(),
+				runWithTimeout: <T>(operation: () => Promise<T>): Promise<T> => {
+					void operation();
+					return Promise.reject(new RemoteRequestTimeoutError());
+				},
+			},
+		);
+		const completedSnapshot = JSON.stringify(result);
+
+		expect(completions).toHaveLength(3);
+		expect(result.records[0]?.reason?.code).toBe("github-request-timeout");
+		for (const complete of completions) {
+			complete(textResponse(200, "{}"));
+		}
+		await flushPromises();
+		expect(JSON.stringify(result)).toBe(completedSnapshot);
 	});
 
 	it("performs target requests sequentially in plugin-ID order", async () => {
@@ -670,3 +894,8 @@ describe("rate limits, failures, and sequential ordering", () => {
 		]);
 	});
 });
+
+async function flushPromises(): Promise<void> {
+	await Promise.resolve();
+	await Promise.resolve();
+}

@@ -21,6 +21,7 @@ import {
 import {
 	type RemoteResolutionBatch,
 	type RemoteResolutionRecord,
+	type RemoteFailureKind,
 	type ResolvedRemoteRecord,
 	type TrustedReleaseAsset,
 } from "./remote-release";
@@ -37,6 +38,14 @@ export type Sha256Function = (bytes: ArrayBuffer) => Promise<string>;
 export interface IntegrityVerificationContext {
 	readonly adapter: IntegrityAdapter;
 	readonly sha256?: Sha256Function;
+	readonly yieldToHost?: () => Promise<void>;
+	readonly onProgress?: (progress: IntegrityVerificationProgress) => void;
+}
+
+export interface IntegrityVerificationProgress {
+	readonly pluginId: string;
+	readonly assetName: ReleaseAssetName;
+	readonly source: "remote-evidence" | "local-artifact";
 }
 
 export interface EvaluatedIntegrityRecord {
@@ -61,6 +70,8 @@ export interface BlockedIntegrityRecord {
 	readonly result: null;
 	readonly reason: IntegrityReason;
 	readonly retryAtMs: number | null;
+	readonly remoteFailureKind?: RemoteFailureKind | null;
+	readonly technicalMessage?: string | null;
 }
 
 export type IntegrityVerificationRecord =
@@ -727,6 +738,11 @@ async function verifyResolvedTarget(
 
 	let manifestDigest: string;
 	try {
+		context.onProgress?.({
+			pluginId: plugin.pluginId,
+			assetName: "manifest.json",
+			source: "remote-evidence",
+		});
 		manifestDigest = (await state.sha256(remote.release.manifestBytes)).toLowerCase();
 	} catch (error) {
 		const problem = reason(
@@ -753,12 +769,18 @@ async function verifyResolvedTarget(
 		);
 		return failedResolvedRecord(plugin, "unverifiable", problem);
 	}
+	await context.yieldToHost?.();
 
 	const assetsByName = new Map(remote.release.assets.map(asset => (
 		[asset.assetName, asset] as const
 	)));
 	const artifacts: ArtifactIntegrityResult[] = [];
 	for (const assetName of RELEASE_ASSET_NAMES) {
+		context.onProgress?.({
+			pluginId: plugin.pluginId,
+			assetName,
+			source: "local-artifact",
+		});
 		artifacts.push(await verifyLocalArtifact(
 			context.adapter,
 			plugin,
@@ -766,6 +788,7 @@ async function verifyResolvedTarget(
 			assetsByName.get(assetName),
 			state,
 		));
+		await context.yieldToHost?.();
 	}
 
 	const status = aggregatePluginStatus(artifacts);
@@ -825,6 +848,12 @@ function blockedRecord(
 		result: null,
 		reason: record.reason,
 		retryAtMs: record.retryAtMs,
+		remoteFailureKind: record.status === "skipped"
+			? null
+			: record.failureKind ?? null,
+		technicalMessage: record.status === "skipped"
+			? null
+			: record.technicalMessage ?? null,
 	};
 }
 

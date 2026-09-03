@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { IntegrityCheckRun } from "../src/check-coordinator";
 import {
 	buildCheckPresentation,
+	hasRetryableRemoteFailure,
 	PRESENTATION_GROUP_ORDER,
 	shouldShowHealthyGroup,
 } from "../src/check-presentation";
@@ -83,6 +84,8 @@ function resolved(plugin: DiscoveredPluginRecord): ResolvedRemoteRecord {
 function unresolved(
 	plugin: DiscoveredPluginRecord,
 	status: UnresolvedRemoteRecord["status"],
+	failureKind: UnresolvedRemoteRecord["failureKind"] = undefined,
+	technicalMessage: string | null = null,
 ): UnresolvedRemoteRecord {
 	if (plugin.repository === null) {
 		throw new Error("Unresolved fixture needs a repository.");
@@ -97,6 +100,8 @@ function unresolved(
 		release: null,
 		reason: { code: `${status}-reason`, message: `${status} message` },
 		retryAtMs: status === "deferred" ? 2_000_000 : null,
+		failureKind,
+		technicalMessage,
 	};
 }
 
@@ -285,6 +290,50 @@ function buildFixtureRun(): IntegrityCheckRun {
 }
 
 describe("check presentation", () => {
+	it("keeps an unmonitored local discovery error out of attention results", () => {
+		const run = buildFixtureRun();
+		const broken = {
+			status: "error" as const,
+			pluginId: "broken-unmonitored",
+			pluginPath: ".obsidian/plugins/broken-unmonitored",
+			repository: null,
+			manifest: null,
+			artifacts: [] as const,
+			reason: { code: "manifest-read-error", message: "Could not read manifest." },
+		};
+		const skippedBroken = skipped(broken, "local-error");
+		const presentation = buildCheckPresentation({
+			...run,
+			discovery: {
+				...run.discovery!,
+				plugins: [...run.discovery!.plugins, broken],
+			},
+			remote: {
+				...run.remote!,
+				records: [...run.remote!.records, skippedBroken],
+			},
+			verification: {
+				...run.verification!,
+				records: [...run.verification!.records, {
+					outcome: "blocked" as const,
+					pluginId: broken.pluginId,
+					repository: null,
+					manifestVersion: null,
+					status: "error" as const,
+					sourceRemoteStatus: "skipped" as const,
+					result: null,
+					reason: skippedBroken.reason,
+					retryAtMs: null,
+				}],
+			},
+		});
+
+		expect(presentation.groups.find(group => group.id === "needs-attention")?.plugins)
+			.not.toEqual(expect.arrayContaining([expect.objectContaining({ pluginId: broken.pluginId })]));
+		expect(presentation.groups.find(group => group.id === "not-configured")?.plugins)
+			.toEqual(expect.arrayContaining([expect.objectContaining({ pluginId: broken.pluginId })]));
+	});
+
 	it("groups every result class in fixed order and sorts plugin IDs within groups", () => {
 		const presentation = buildCheckPresentation(buildFixtureRun());
 
@@ -344,6 +393,67 @@ describe("check presentation", () => {
 
 		expect(healthy?.pluginName).toBe("<img src=x onerror=alert(1)>");
 		expect(healthy?.statusLabel).toBe("Up to date");
+	});
+
+	it("keeps raw mobile transport errors in technical details and uses a friendly status", () => {
+		const run = buildFixtureRun();
+		const plugin = discovered("mobile-offline");
+		const rawMessage = "UnknownHostException: Unable to resolve host api.github.com";
+		const remote = unresolved(plugin, "error", "connection", rawMessage);
+		const presentation = buildCheckPresentation({
+			...run,
+			settingsIssues: [],
+			discovery: { ...run.discovery!, plugins: [plugin] },
+			remote: { ...run.remote!, records: [remote] },
+			verification: {
+				status: "partial",
+				records: [{
+					...blocked(plugin, "error", "error"),
+					reason: remote.reason,
+					remoteFailureKind: "connection",
+					technicalMessage: rawMessage,
+				}],
+				reason: null,
+			},
+		});
+		const result = presentation.groups.find(group => group.id === "needs-attention")?.plugins[0];
+
+		expect(result?.statusLabel).toBe("Connection unavailable");
+		expect(result?.reasonMessage).toBe("error message");
+		expect(result?.technicalMessage).toBe(rawMessage);
+		expect(result?.remoteFailureKind).toBe("connection");
+		expect(hasRetryableRemoteFailure(presentation)).toBe(true);
+	});
+
+	it("reserves Check failed for unexpected remote failures", () => {
+		const base = buildFixtureRun();
+		const localPresentation = buildCheckPresentation(base);
+		const localFailure = localPresentation.groups
+			.find(group => group.id === "needs-attention")?.plugins
+			.find(plugin => plugin.pluginId === "failed");
+		expect(localFailure?.statusLabel).toBe("Local verification unavailable");
+
+		const plugin = discovered("unexpected");
+		const remote = unresolved(plugin, "error", "unexpected", "HTTP 418");
+		const unexpectedPresentation = buildCheckPresentation({
+			...base,
+			settingsIssues: [],
+			discovery: { ...base.discovery!, plugins: [plugin] },
+			remote: { ...base.remote!, records: [remote] },
+			verification: {
+				status: "partial",
+				records: [{
+					...blocked(plugin, "error", "error"),
+					reason: remote.reason,
+					remoteFailureKind: "unexpected",
+					technicalMessage: "HTTP 418",
+				}],
+				reason: null,
+			},
+		});
+		expect(unexpectedPresentation.groups
+			.find(group => group.id === "needs-attention")?.plugins[0]?.statusLabel)
+			.toBe("Check failed");
 	});
 
 	it("shows healthy plugins only when the result has no visible problems", () => {
