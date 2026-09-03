@@ -21,6 +21,7 @@ import {
 import {
 	type RemoteResolutionBatch,
 	type RemoteResolutionRecord,
+	type RemoteFailureKind,
 	type ResolvedRemoteRecord,
 	type TrustedReleaseAsset,
 } from "./remote-release";
@@ -61,6 +62,8 @@ export interface BlockedIntegrityRecord {
 	readonly result: null;
 	readonly reason: IntegrityReason;
 	readonly retryAtMs: number | null;
+	readonly remoteFailureKind?: RemoteFailureKind | null;
+	readonly technicalMessage?: string | null;
 }
 
 export type IntegrityVerificationRecord =
@@ -825,6 +828,12 @@ function blockedRecord(
 		result: null,
 		reason: record.reason,
 		retryAtMs: record.retryAtMs,
+		remoteFailureKind: record.status === "skipped"
+			? null
+			: record.failureKind ?? null,
+		technicalMessage: record.status === "skipped"
+			? null
+			: record.technicalMessage ?? null,
 	};
 }
 

@@ -21,6 +21,7 @@ import {
 } from "./community-catalog";
 import {
 	buildCheckPresentation,
+	hasRetryableRemoteFailure,
 	shouldShowHealthyGroup,
 	type ArtifactPresentation,
 	type CheckPresentation,
@@ -161,6 +162,9 @@ function renderPlugin(
 		}
 		if (plugin.reasonCode !== null) {
 			appendLabelValue(technicalBody, "Reason", plugin.reasonCode, true);
+		}
+		if (plugin.technicalMessage !== null) {
+			appendLabelValue(technicalBody, "Technical error", plugin.technicalMessage, true);
 		}
 	}
 	const technicalArtifacts = plugin.groupId === "repair-available"
@@ -304,6 +308,7 @@ export class IntegrityResultsModal extends Modal {
 
 		let footerRepairPlugins: readonly PluginPresentation[] = [];
 		let footerRepairBlocked = false;
+		let retryAvailable = false;
 		if (
 			!isRunning
 			&& !repairRunning
@@ -312,6 +317,7 @@ export class IntegrityResultsModal extends Modal {
 		) {
 			const latestRun = snapshot.latestRun;
 			const presentation = buildCheckPresentation(latestRun);
+			retryAvailable = hasRetryableRemoteFailure(presentation);
 			const repairPlugins = presentation.groups.find(group => (
 				group.id === "repair-available"
 			))?.plugins ?? [];
@@ -351,6 +357,15 @@ export class IntegrityResultsModal extends Modal {
 			.setTooltip("Closes this window without repairing any plugins.")
 			.onClick(() => this.close());
 		const primaryActions = actions.createDiv({ cls: "sync-assets-result-primary-actions" });
+		if (retryAvailable) {
+			new ButtonComponent(primaryActions)
+				.setButtonText("Try again")
+				.setTooltip("Runs the integrity check again.")
+				.setDisabled(isRunning || repairRunning)
+				.onClick(() => {
+					void this.startCheck();
+				});
+		}
 		if (footerRepairPlugins.length > 0 && !footerRepairBlocked && snapshot.latestRun !== null) {
 			const latestRun = snapshot.latestRun;
 			const needsFullRestart = footerRepairPlugins.some(plugin => (

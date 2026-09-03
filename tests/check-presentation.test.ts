@@ -83,6 +83,8 @@ function resolved(plugin: DiscoveredPluginRecord): ResolvedRemoteRecord {
 function unresolved(
 	plugin: DiscoveredPluginRecord,
 	status: UnresolvedRemoteRecord["status"],
+	failureKind: UnresolvedRemoteRecord["failureKind"] = undefined,
+	technicalMessage: string | null = null,
 ): UnresolvedRemoteRecord {
 	if (plugin.repository === null) {
 		throw new Error("Unresolved fixture needs a repository.");
@@ -97,6 +99,8 @@ function unresolved(
 		release: null,
 		reason: { code: `${status}-reason`, message: `${status} message` },
 		retryAtMs: status === "deferred" ? 2_000_000 : null,
+		failureKind,
+		technicalMessage,
 	};
 }
 
@@ -388,6 +392,35 @@ describe("check presentation", () => {
 
 		expect(healthy?.pluginName).toBe("<img src=x onerror=alert(1)>");
 		expect(healthy?.statusLabel).toBe("Up to date");
+	});
+
+	it("keeps raw mobile transport errors in technical details and uses a friendly status", () => {
+		const run = buildFixtureRun();
+		const plugin = discovered("mobile-offline");
+		const rawMessage = "UnknownHostException: Unable to resolve host api.github.com";
+		const remote = unresolved(plugin, "error", "connection", rawMessage);
+		const presentation = buildCheckPresentation({
+			...run,
+			settingsIssues: [],
+			discovery: { ...run.discovery!, plugins: [plugin] },
+			remote: { ...run.remote!, records: [remote] },
+			verification: {
+				status: "partial",
+				records: [{
+					...blocked(plugin, "error", "error"),
+					reason: remote.reason,
+					remoteFailureKind: "connection",
+					technicalMessage: rawMessage,
+				}],
+				reason: null,
+			},
+		});
+		const result = presentation.groups.find(group => group.id === "needs-attention")?.plugins[0];
+
+		expect(result?.statusLabel).toBe("Connection unavailable");
+		expect(result?.reasonMessage).toBe("error message");
+		expect(result?.technicalMessage).toBe(rawMessage);
+		expect(result?.remoteFailureKind).toBe("connection");
 	});
 
 	it("shows healthy plugins only when the result has no visible problems", () => {

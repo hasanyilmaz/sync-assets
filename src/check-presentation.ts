@@ -9,7 +9,10 @@ import type {
 	IntegrityCheckRun,
 } from "./check-coordinator";
 import type { LocalPluginRecord } from "./local-discovery";
-import type { RemoteResolutionRecord } from "./remote-release";
+import type {
+	RemoteFailureKind,
+	RemoteResolutionRecord,
+} from "./remote-release";
 
 export const PRESENTATION_GROUP_ORDER = [
 	"repair-available",
@@ -49,6 +52,8 @@ export interface PluginPresentation {
 	readonly reasonCode: string | null;
 	readonly reasonMessage: string | null;
 	readonly retryAtMs: number | null;
+	readonly remoteFailureKind: RemoteFailureKind | null;
+	readonly technicalMessage: string | null;
 	readonly artifacts: readonly ArtifactPresentation[];
 }
 
@@ -106,6 +111,23 @@ export const INTEGRITY_STATUS_LABELS: Readonly<Record<IntegrityStatus, string>> 
 	unverifiable: "Could not verify",
 	error: "Check failed",
 };
+
+const REMOTE_FAILURE_STATUS_LABELS: Partial<Readonly<Record<RemoteFailureKind, string>>> = {
+	connection: "Connection unavailable",
+	timeout: "GitHub did not respond in time",
+	"temporary-server": "GitHub is temporarily unavailable",
+	"rate-limit": "GitHub rate limit reached",
+};
+
+export function hasRetryableRemoteFailure(
+	presentation: CheckPresentation,
+): boolean {
+	return presentation.groups.some(group => group.plugins.some(plugin => (
+		plugin.remoteFailureKind !== null
+		&& ["connection", "timeout", "temporary-server", "rate-limit"]
+			.includes(plugin.remoteFailureKind)
+	)));
+}
 
 function artifactPresentation(
 	artifact: ArtifactIntegrityResult,
@@ -199,6 +221,12 @@ export function buildCheckPresentation(
 		const artifacts = verification?.outcome === "evaluated"
 			? verification.result.artifacts.map(artifactPresentation)
 			: [];
+		const remoteFailureKind = remote !== undefined && remote.status !== "resolved" && remote.status !== "skipped"
+			? remote.failureKind ?? null
+			: null;
+		const technicalMessage = remote !== undefined && remote.status !== "resolved" && remote.status !== "skipped"
+			? remote.technicalMessage ?? null
+			: null;
 
 		grouped.get(groupId)?.push({
 			groupId,
@@ -208,10 +236,15 @@ export function buildCheckPresentation(
 			manifestVersion,
 			releaseTag,
 			status,
-			statusLabel: INTEGRITY_STATUS_LABELS[status],
+			statusLabel: remoteFailureKind === null
+				? INTEGRITY_STATUS_LABELS[status]
+				: REMOTE_FAILURE_STATUS_LABELS[remoteFailureKind]
+					?? INTEGRITY_STATUS_LABELS[status],
 			reasonCode: problem?.code ?? null,
 			reasonMessage: problem?.message ?? null,
 			retryAtMs: verification?.retryAtMs ?? remote?.retryAtMs ?? null,
+			remoteFailureKind,
+			technicalMessage,
 			artifacts,
 		});
 	}

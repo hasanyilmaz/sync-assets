@@ -24,6 +24,14 @@ export interface StartupAttentionSummary {
 	readonly message: string;
 }
 
+export type StartupRunDisposition =
+	| { readonly disposition: "none" }
+	| { readonly disposition: "notice"; readonly message: string }
+	| {
+		readonly disposition: "modal";
+		readonly summary: StartupAttentionSummary;
+	};
+
 export class StartupCheckController {
 	private attempted = false;
 	private manualIntent = false;
@@ -67,7 +75,7 @@ export class StartupCheckController {
 	}
 }
 
-export function buildStartupAttentionSummary(
+function buildStartupAttentionSummary(
 	run: IntegrityCheckRun,
 ): StartupAttentionSummary | null {
 	const presentation = buildCheckPresentation(run);
@@ -101,4 +109,35 @@ export function buildStartupAttentionSummary(
 		configuredMissing,
 		message: `Sync Assets startup check: ${parts.join("; ")}.`,
 	};
+}
+
+export function buildStartupRunDisposition(
+	run: IntegrityCheckRun,
+): StartupRunDisposition {
+	const presentation = buildCheckPresentation(run);
+	const actionablePlugins = presentation.groups.flatMap(group => (
+		["repair-available", "needs-attention", "configured-missing"].includes(group.id)
+			? group.plugins
+			: []
+	));
+	const availabilityOnly = run.status !== "failed"
+		&& presentation.reasonCode === null
+		&& presentation.settingsWarnings.length === 0
+		&& actionablePlugins.length > 0
+		&& actionablePlugins.every(plugin => (
+			plugin.remoteFailureKind !== null
+			&& ["connection", "timeout", "temporary-server", "rate-limit"]
+				.includes(plugin.remoteFailureKind)
+		));
+	if (availabilityOnly) {
+		return {
+			disposition: "notice",
+			message: "Sync Assets couldn't check monitored plugins because GitHub is unavailable. Check your connection and try again later.",
+		};
+	}
+
+	const summary = buildStartupAttentionSummary(run);
+	return summary === null
+		? { disposition: "none" }
+		: { disposition: "modal", summary };
 }

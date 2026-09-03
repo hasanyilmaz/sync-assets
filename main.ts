@@ -54,7 +54,7 @@ import {
 	type SyncAssetsSettings,
 } from "./src/settings";
 import {
-	buildStartupAttentionSummary,
+	buildStartupRunDisposition,
 	StartupCheckController,
 } from "./src/startup-check";
 import { StartupLocalFollowUpController } from "./src/startup-local-follow-up";
@@ -80,6 +80,7 @@ export default class SyncAssetsPlugin extends Plugin {
 	private startupController: StartupCheckController | null = null;
 	private startupFollowUpController: StartupLocalFollowUpController | null = null;
 	private loaded = false;
+	private availabilityNoticeShown = false;
 	private readonly sessionId = createSessionId();
 
 	async onload(): Promise<void> {
@@ -287,8 +288,15 @@ export default class SyncAssetsPlugin extends Plugin {
 	private async handleAutomaticRun(run: IntegrityCheckRun): Promise<void> {
 		await this.reconcilePostRestartEvidence(run, false);
 		await this.removeVerifiedSuccessfulRepairs();
-		const summary = buildStartupAttentionSummary(run);
-		if (summary === null) {
+		const disposition = buildStartupRunDisposition(run);
+		if (disposition.disposition === "none") {
+			return;
+		}
+		if (disposition.disposition === "notice") {
+			if (!this.availabilityNoticeShown) {
+				this.availabilityNoticeShown = true;
+				new Notice(disposition.message);
+			}
 			return;
 		}
 		this.resultsModal?.open();

@@ -10,7 +10,7 @@ import type { LocalDiscoveryResult } from "../src/local-discovery";
 import type { RemoteResolutionBatch } from "../src/remote-release";
 import type { SettingsState } from "../src/settings-controller";
 import {
-	buildStartupAttentionSummary,
+	buildStartupRunDisposition,
 	StartupCheckController,
 } from "../src/startup-check";
 import { createRepairFixture } from "./repair-fixtures";
@@ -146,23 +146,30 @@ describe("startup integrity check", () => {
 			verification: VERIFICATION,
 			reason: null,
 		};
-		expect(buildStartupAttentionSummary(emptyRun)).toBeNull();
+		expect(buildStartupRunDisposition(emptyRun)).toEqual({ disposition: "none" });
 
 		const fixture = await createRepairFixture();
 		const repairRun: IntegrityCheckRun = { ...fixture.run, trigger: "startup" };
-		expect(buildStartupAttentionSummary(repairRun)).toEqual(expect.objectContaining({
-			failed: false,
-			repairAvailable: 1,
-			needsAttention: 0,
-			configuredMissing: 0,
-		}));
-		const failed = buildStartupAttentionSummary({
+		const repairDisposition = buildStartupRunDisposition(repairRun);
+		expect(repairDisposition.disposition).toBe("modal");
+		if (repairDisposition.disposition === "modal") {
+			expect(repairDisposition.summary).toEqual(expect.objectContaining({
+				failed: false,
+				repairAvailable: 1,
+				needsAttention: 0,
+				configuredMissing: 0,
+			}));
+		}
+		const failed = buildStartupRunDisposition({
 			...emptyRun,
 			status: "failed",
 			reason: { code: "failed", message: "Failed." },
 		});
-		expect(failed?.failed).toBe(true);
-		expect(failed?.message).toContain("check failed");
+		expect(failed.disposition).toBe("modal");
+		if (failed.disposition === "modal") {
+			expect(failed.summary.failed).toBe(true);
+			expect(failed.summary.message).toContain("check failed");
+		}
 	});
 
 	it("ignores unmapped plugins but reports deferrals and configured-missing targets", async () => {
@@ -215,7 +222,7 @@ describe("startup integrity check", () => {
 				reason: null,
 			},
 		};
-		expect(buildStartupAttentionSummary(unmapped)).toBeNull();
+		expect(buildStartupRunDisposition(unmapped)).toEqual({ disposition: "none" });
 
 		const rateLimitReason = { code: "github-rate-limit-exhausted", message: "Deferred." };
 		const deferred: IntegrityCheckRun = {
@@ -233,6 +240,8 @@ describe("startup integrity check", () => {
 					release: null,
 					reason: rateLimitReason,
 					retryAtMs: 2_000_000,
+					failureKind: "rate-limit",
+					technicalMessage: null,
 				}],
 				requestCount: 0,
 				rateLimit: { limit: 60, remaining: 0, resetAtMs: 2_000_000, retryAtMs: 2_000_000 },
@@ -254,7 +263,9 @@ describe("startup integrity check", () => {
 				reason: null,
 			},
 		};
-		expect(buildStartupAttentionSummary(deferred)?.needsAttention).toBe(1);
+		expect(buildStartupRunDisposition(deferred)).toEqual(expect.objectContaining({
+			disposition: "notice",
+		}));
 
 		const missingReason = { code: "configured-plugin-missing", message: "Missing." };
 		const configuredMissing: IntegrityCheckRun = {
@@ -305,6 +316,70 @@ describe("startup integrity check", () => {
 				reason: null,
 			},
 		};
-		expect(buildStartupAttentionSummary(configuredMissing)?.configuredMissing).toBe(1);
+		const missingDisposition = buildStartupRunDisposition(configuredMissing);
+		expect(missingDisposition.disposition).toBe("modal");
+		if (missingDisposition.disposition === "modal") {
+			expect(missingDisposition.summary.configuredMissing).toBe(1);
+		}
+	});
+
+	it("uses a Notice only when all actionable results are remote availability failures", async () => {
+		const fixture = await createRepairFixture();
+		const local = fixture.run.discovery?.plugins[0];
+		if (local?.status !== "discovered" || local.repository === null) {
+			throw new Error("Discovery fixture missing.");
+		}
+		const connectionReason = {
+			code: "github-connection-unavailable",
+			message: "Sync Assets couldn't reach GitHub.",
+		};
+		const run: IntegrityCheckRun = {
+			...fixture.run,
+			trigger: "startup",
+			remote: {
+				status: "partial",
+				records: [{
+					status: "error",
+					pluginId: local.pluginId,
+					repository: local.repository,
+					manifestVersion: local.manifest.version,
+					requestCount: 3,
+					rateLimit: null,
+					release: null,
+					reason: connectionReason,
+					retryAtMs: null,
+					failureKind: "connection",
+					technicalMessage: "UnknownHostException: api.github.com",
+				}],
+				requestCount: 3,
+				rateLimit: null,
+				reason: null,
+			},
+			verification: {
+				status: "partial",
+				records: [{
+					outcome: "blocked",
+					pluginId: local.pluginId,
+					repository: local.repository,
+					manifestVersion: local.manifest.version,
+					status: "error",
+					sourceRemoteStatus: "error",
+					result: null,
+					reason: connectionReason,
+					retryAtMs: null,
+					remoteFailureKind: "connection",
+					technicalMessage: "UnknownHostException: api.github.com",
+				}],
+				reason: null,
+			},
+		};
+
+		expect(buildStartupRunDisposition(run)).toEqual(expect.objectContaining({
+			disposition: "notice",
+		}));
+		expect(buildStartupRunDisposition({
+			...run,
+			settingsIssues: [{ code: "invalid", path: "", message: "Invalid." }],
+		}).disposition).toBe("modal");
 	});
 });
