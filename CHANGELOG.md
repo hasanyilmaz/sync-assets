@@ -20,7 +20,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed Android and iOS connectivity failures appearing as generic **Check failed** results. Connection, timeout, temporary GitHub service, rate-limit, unsupported-response, and unexpected failures now have distinct user-facing states, while platform exception text remains under **Technical details**.
 - Fixed automatic checks opening the results modal for availability-only failures. Automatic checks now show at most one short Notice per app session, while manual checks continue to open the modal and offer **Try again** when appropriate.
 - Fixed late read-only check completions updating state or starting UI, repair-journal reconciliation, or cleanup after a timeout or plugin unload.
-
-### Validation
-
-- Passed strict lint, TypeScript and production builds, the Sync Assets Release Guard, and the complete automated suite with **294/294 tests**, including monitored-only discovery, Android and iOS transport failures, retry timing and request budgets, batch circuit breaking, late Sync changes, lifecycle cancellation, and sequential 5 MiB, 16 MiB, and 64 MiB hashing.
