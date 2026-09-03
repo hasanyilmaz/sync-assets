@@ -299,7 +299,7 @@ export class IntegrityResultsModal extends Modal {
 			this.contentEl.createEl("p", {
 				cls: "sync-assets-progress",
 				text: isRunning
-					? PHASE_LABELS[snapshot.phase]
+					? snapshot.progressLabel ?? PHASE_LABELS[snapshot.phase]
 					: this.repairSnapshot.operation === "cleaning-up"
 						? "Removing verified backup…"
 						: "Repairing plugins…",

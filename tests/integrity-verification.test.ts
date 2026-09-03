@@ -682,6 +682,69 @@ describe("integrity verification", () => {
 		expect(adapter.calls).not.toContain("readBinary:.custom/plugins/oversized/main.js");
 	});
 
+	it("processes 5, 16, and 64 MiB artifacts sequentially with progress and host yields", async () => {
+		const mebibyte = 1024 * 1024;
+		const fixtures = [
+			{ plugin: localPlugin("five") as DiscoveredPluginRecord & { repository: GitHubRepository }, size: 5 * mebibyte },
+			{ plugin: localPlugin("sixteen") as DiscoveredPluginRecord & { repository: GitHubRepository }, size: 16 * mebibyte },
+			{ plugin: localPlugin("sixty-four") as DiscoveredPluginRecord & { repository: GitHubRepository }, size: 64 * mebibyte },
+		];
+		const adapter = new FakeIntegrityAdapter();
+		const fallbackSha = new FakeSha256();
+		let activeLargeHashes = 0;
+		let maxActiveLargeHashes = 0;
+		const largeHashSizes: number[] = [];
+		const progress: string[] = [];
+		let yields = 0;
+		for (const fixture of fixtures) {
+			installMatchingPlugin(adapter, fixture.plugin);
+			adapter.setFile(`${fixture.plugin.pluginPath}/main.js`, new ArrayBuffer(fixture.size));
+		}
+		const sha256: Sha256Function = async bytes => {
+			if (bytes.byteLength < mebibyte) {
+				return fallbackSha.hash(bytes);
+			}
+			activeLargeHashes += 1;
+			maxActiveLargeHashes = Math.max(maxActiveLargeHashes, activeLargeHashes);
+			largeHashSizes.push(bytes.byteLength);
+			await Promise.resolve();
+			activeLargeHashes -= 1;
+			return LARGE_DIGEST;
+		};
+
+		const result = await verifyPluginIntegrity(
+			discovery(fixtures.map(fixture => fixture.plugin)),
+			remoteBatch(fixtures.map(fixture => resolvedRecord(fixture.plugin, {
+				mainSize: fixture.size,
+				mainDigest: LARGE_DIGEST,
+			}))),
+			{
+				adapter,
+				sha256,
+				yieldToHost: () => {
+					yields += 1;
+					return Promise.resolve();
+				},
+				onProgress: event => {
+					progress.push(`${event.pluginId}:${event.assetName}:${event.source}`);
+				},
+			},
+		);
+
+		for (const fixture of fixtures) {
+			expect(artifact(evaluated(result, fixture.plugin.pluginId), "main.js").status).toBe("healthy");
+		}
+		expect(largeHashSizes).toEqual([5 * mebibyte, 16 * mebibyte, 64 * mebibyte]);
+		expect(maxActiveLargeHashes).toBe(1);
+		expect(adapter.maxActiveReads).toBe(1);
+		expect(yields).toBe(fixtures.length * 4);
+		expect(progress).toEqual(expect.arrayContaining([
+			"five:main.js:local-artifact",
+			"sixteen:main.js:local-artifact",
+			"sixty-four:main.js:local-artifact",
+		]));
+	});
+
 	it("reports an unexpected local styles.css without making deletion repairable", async () => {
 		const plugin = localPlugin("styled") as DiscoveredPluginRecord & { repository: GitHubRepository };
 		const adapter = new FakeIntegrityAdapter();

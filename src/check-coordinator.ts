@@ -36,6 +36,7 @@ export interface CheckCoordinatorSnapshot {
 	readonly phase: CheckPhase;
 	readonly activeRunId: number | null;
 	readonly latestRun: IntegrityCheckRun | null;
+	readonly progressLabel: string | null;
 }
 
 export interface CheckPipelineDependencies {
@@ -44,6 +45,7 @@ export interface CheckPipelineDependencies {
 	readonly verify: (
 		discovery: LocalDiscoveryResult,
 		remote: RemoteResolutionBatch,
+		reportProgress: (label: string) => void,
 	) => Promise<IntegrityVerificationBatch>;
 	readonly now?: () => number;
 }
@@ -76,6 +78,7 @@ export class IntegrityCheckCoordinator {
 	private activePromise: Promise<IntegrityCheckRun> | null = null;
 	private activeRunId: number | null = null;
 	private latestRun: IntegrityCheckRun | null = null;
+	private progressLabel: string | null = null;
 	private nextRunId = 1;
 	private lifecycleGeneration = 0;
 	private disposed = false;
@@ -88,6 +91,7 @@ export class IntegrityCheckCoordinator {
 			phase: this.phase,
 			activeRunId: this.activeRunId,
 			latestRun: this.latestRun,
+			progressLabel: this.progressLabel,
 		};
 	}
 
@@ -149,6 +153,7 @@ export class IntegrityCheckCoordinator {
 		this.activePromise = null;
 		this.activeRunId = null;
 		this.phase = "idle";
+		this.progressLabel = null;
 		this.listeners.clear();
 	}
 
@@ -177,7 +182,16 @@ export class IntegrityCheckCoordinator {
 				return this.cancelledRun(runId, trigger, settingsIssues, startedAtMs, discovery, remote);
 			}
 			this.setPhase("verifying");
-			verification = await this.dependencies.verify(discovery, remote);
+			verification = await this.dependencies.verify(
+				discovery,
+				remote,
+				label => {
+					if (this.isCurrent(lifecycleGeneration) && this.phase === "verifying") {
+						this.progressLabel = label;
+						this.emit();
+					}
+				},
+			);
 			if (!this.isCurrent(lifecycleGeneration)) {
 				return this.cancelledRun(runId, trigger, settingsIssues, startedAtMs, discovery, remote, verification);
 			}
@@ -260,6 +274,7 @@ export class IntegrityCheckCoordinator {
 
 	private setPhase(phase: CheckPhase): void {
 		this.phase = phase;
+		this.progressLabel = null;
 		this.emit();
 	}
 

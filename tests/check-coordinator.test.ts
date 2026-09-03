@@ -197,7 +197,30 @@ describe("integrity check coordinator", () => {
 			phase: "idle",
 			activeRunId: null,
 			latestRun: null,
+			progressLabel: null,
 		});
 		expect(snapshots.at(-1)).toBe("discovering:none");
+	});
+
+	it("publishes active plugin and file progress only during verification", async () => {
+		const labels: Array<string | null> = [];
+		const coordinator = new IntegrityCheckCoordinator({
+			discover: (): Promise<LocalDiscoveryResult> => Promise.resolve(DISCOVERY),
+			resolve: (): Promise<RemoteResolutionBatch> => Promise.resolve(REMOTE),
+			verify: (_discovery, _remote, reportProgress): Promise<IntegrityVerificationBatch> => {
+				reportProgress("Verifying operon: main.js…");
+				reportProgress("Verifying operon: manifest.json…");
+				return Promise.resolve(VERIFICATION);
+			},
+		});
+		coordinator.subscribe(snapshot => {
+			labels.push(snapshot.progressLabel);
+		});
+
+		await coordinator.run(createDefaultSettings());
+
+		expect(labels).toContain("Verifying operon: main.js…");
+		expect(labels).toContain("Verifying operon: manifest.json…");
+		expect(coordinator.getSnapshot().progressLabel).toBeNull();
 	});
 });

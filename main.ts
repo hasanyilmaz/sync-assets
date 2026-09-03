@@ -115,10 +115,19 @@ export default class SyncAssetsPlugin extends Plugin {
 			verify: (
 				discovery: LocalDiscoveryResult,
 				remote: RemoteResolutionBatch,
+				reportProgress: (label: string) => void,
 			): Promise<IntegrityVerificationBatch> => verifyPluginIntegrity(
 				discovery,
 				remote,
-				{ adapter: this.app.vault.adapter },
+				{
+					adapter: this.app.vault.adapter,
+					yieldToHost: () => new Promise(resolve => {
+						window.setTimeout(resolve, 0);
+					}),
+					onProgress: progress => {
+						reportProgress(`Verifying ${progress.pluginId}: ${progress.assetName}…`);
+					},
+				},
 			),
 		});
 		this.startupController = new StartupCheckController(
