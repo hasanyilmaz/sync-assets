@@ -632,6 +632,36 @@ describe("rate limits, failures, and sequential ordering", () => {
 		expect(http.calls).toHaveLength(1);
 	});
 
+	it("uses Retry-After for a rate-limited 403 without scheduling a retry", async () => {
+		const http = new FakeRemoteHttp();
+		http.enqueue(
+			apiUrl(DEFAULT_REPOSITORY, "1.2.3"),
+			textResponse(403, "{}", { "Retry-After": "45" }),
+		);
+
+		const result = await resolveRemoteReleases(
+			discoveryResult([discoveredPlugin("operon")]),
+			context(http, 1_000_000),
+		);
+
+		expect(result.records[0]?.status).toBe("deferred");
+		expect(result.records[0]?.retryAtMs).toBe(1_045_000);
+		expect(http.calls).toHaveLength(1);
+	});
+
+	it.each([400, 401, 418, 422])("does not retry HTTP %i", async status => {
+		const http = new FakeRemoteHttp();
+		http.enqueue(apiUrl(DEFAULT_REPOSITORY, "1.2.3"), textResponse(status, "{}"));
+
+		const result = await resolveRemoteReleases(
+			discoveryResult([discoveredPlugin("operon")]),
+			context(http),
+		);
+
+		expect(result.records[0]?.status).toBe("error");
+		expect(http.calls).toHaveLength(1);
+	});
+
 	it("does not retry a normal 403 and continues with the next target", async () => {
 		const http = new FakeRemoteHttp();
 		const alpha = discoveredPlugin("alpha");
@@ -688,6 +718,33 @@ describe("rate limits, failures, and sequential ordering", () => {
 			}
 		}
 		expect(http.calls).toHaveLength(3);
+	});
+
+	it.each([
+		"UnknownHostException: Unable to resolve host api.github.com",
+		"NSURLErrorDomain Code=-1009 The Internet connection appears to be offline.",
+	])("keeps platform transport text technical while returning a friendly reason", async platformMessage => {
+		const http = new FakeRemoteHttp();
+		http.enqueue(
+			apiUrl(DEFAULT_REPOSITORY, "1.2.3"),
+			new Error(platformMessage),
+			new Error(platformMessage),
+			new Error(platformMessage),
+		);
+
+		const result = await resolveRemoteReleases(
+			discoveryResult([discoveredPlugin("operon")]),
+			context(http),
+		);
+		const record = result.records[0];
+		if (record?.status !== "error") {
+			throw new Error("Expected a remote error record.");
+		}
+
+		expect(record.reason.message).toContain("couldn't reach GitHub");
+		expect(record.reason.message).not.toContain(platformMessage);
+		expect(record.technicalMessage).toBe(platformMessage);
+		expect(record.failureKind).toBe("connection");
 	});
 
 	it.each([408, 425, 500, 502, 503, 504])(

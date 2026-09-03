@@ -135,7 +135,9 @@ function artifactPresentation(
 	return {
 		assetName: artifact.assetName,
 		status: artifact.status,
-		statusLabel: INTEGRITY_STATUS_LABELS[artifact.status],
+		statusLabel: artifact.status === "error"
+			? "Local verification unavailable"
+			: INTEGRITY_STATUS_LABELS[artifact.status],
 		expectedSizeBytes: artifact.expected?.sizeBytes ?? null,
 		localExists: artifact.local.exists,
 		localSizeBytes: artifact.local.sizeBytes,
@@ -146,6 +148,19 @@ function artifactPresentation(
 		reasonCode: artifact.reason?.code ?? null,
 		reasonMessage: artifact.reason?.message ?? null,
 	};
+}
+
+function pluginStatusLabel(
+	status: IntegrityStatus,
+	remoteFailureKind: RemoteFailureKind | null,
+): string {
+	if (remoteFailureKind !== null) {
+		return REMOTE_FAILURE_STATUS_LABELS[remoteFailureKind]
+			?? INTEGRITY_STATUS_LABELS[status];
+	}
+	return status === "error"
+		? "Local verification unavailable"
+		: INTEGRITY_STATUS_LABELS[status];
 }
 
 function repositorySlug(plugin: LocalPluginRecord): string | null {
@@ -236,10 +251,7 @@ export function buildCheckPresentation(
 			manifestVersion,
 			releaseTag,
 			status,
-			statusLabel: remoteFailureKind === null
-				? INTEGRITY_STATUS_LABELS[status]
-				: REMOTE_FAILURE_STATUS_LABELS[remoteFailureKind]
-					?? INTEGRITY_STATUS_LABELS[status],
+			statusLabel: pluginStatusLabel(status, remoteFailureKind),
 			reasonCode: problem?.code ?? null,
 			reasonMessage: problem?.message ?? null,
 			retryAtMs: verification?.retryAtMs ?? remote?.retryAtMs ?? null,

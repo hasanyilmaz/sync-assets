@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { IntegrityCheckRun } from "../src/check-coordinator";
 import {
 	buildCheckPresentation,
+	hasRetryableRemoteFailure,
 	PRESENTATION_GROUP_ORDER,
 	shouldShowHealthyGroup,
 } from "../src/check-presentation";
@@ -421,6 +422,38 @@ describe("check presentation", () => {
 		expect(result?.reasonMessage).toBe("error message");
 		expect(result?.technicalMessage).toBe(rawMessage);
 		expect(result?.remoteFailureKind).toBe("connection");
+		expect(hasRetryableRemoteFailure(presentation)).toBe(true);
+	});
+
+	it("reserves Check failed for unexpected remote failures", () => {
+		const base = buildFixtureRun();
+		const localPresentation = buildCheckPresentation(base);
+		const localFailure = localPresentation.groups
+			.find(group => group.id === "needs-attention")?.plugins
+			.find(plugin => plugin.pluginId === "failed");
+		expect(localFailure?.statusLabel).toBe("Local verification unavailable");
+
+		const plugin = discovered("unexpected");
+		const remote = unresolved(plugin, "error", "unexpected", "HTTP 418");
+		const unexpectedPresentation = buildCheckPresentation({
+			...base,
+			settingsIssues: [],
+			discovery: { ...base.discovery!, plugins: [plugin] },
+			remote: { ...base.remote!, records: [remote] },
+			verification: {
+				status: "partial",
+				records: [{
+					...blocked(plugin, "error", "error"),
+					reason: remote.reason,
+					remoteFailureKind: "unexpected",
+					technicalMessage: "HTTP 418",
+				}],
+				reason: null,
+			},
+		});
+		expect(unexpectedPresentation.groups
+			.find(group => group.id === "needs-attention")?.plugins[0]?.statusLabel)
+			.toBe("Check failed");
 	});
 
 	it("shows healthy plugins only when the result has no visible problems", () => {

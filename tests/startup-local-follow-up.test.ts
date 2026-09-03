@@ -286,6 +286,37 @@ describe("startup local follow-up controller", () => {
 		expect(fullChecks).toBe(2);
 	});
 
+	it("does not accept new settings changes after the three-minute window closes", async () => {
+		const scheduler = createScheduler();
+		let current = settingsState({
+			settings: { ...settingsState().settings, repositories: [] },
+		});
+		let fullChecks = 0;
+		const controller = new StartupLocalFollowUpController({
+			getSettingsState: (): SettingsState => current,
+			probe: (): Promise<string | null> => Promise.resolve("files"),
+			isBusy: (): boolean => false,
+			runFullCheck: (): Promise<IntegrityCheckRun | null> => {
+				fullChecks += 1;
+				return Promise.resolve({} as IntegrityCheckRun);
+			},
+			schedule: scheduler.schedule,
+		});
+		controller.start();
+		for (const delayMs of STARTUP_LOCAL_FOLLOW_UP_DELAYS_MS) {
+			scheduler.runNext(delayMs);
+			await flush();
+		}
+
+		current = settingsState();
+		controller.notifySettingsChanged();
+
+		expect(scheduler.tasks.filter(task => (
+			!task.cancelled && task.delayMs === STARTUP_LOCAL_STABILITY_DELAY_MS
+		))).toHaveLength(0);
+		expect(fullChecks).toBe(0);
+	});
+
 	it("skips a busy deadline and cancels pending work on unload", async () => {
 		const scheduler = createScheduler();
 		let busy = true;
