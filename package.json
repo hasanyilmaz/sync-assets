@@ -1,6 +1,6 @@
 {
 	"name": "sync-assets",
-	"version": "1.0.2",
+	"version": "1.0.3",
 	"description": "Detect and repair oversized community plugin assets skipped during sync.",
 	"type": "module",
 	"private": true,
