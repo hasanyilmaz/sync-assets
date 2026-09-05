@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed repairs applying outdated release files when Sync changes the installed manifest identity or version after a check or during repair.
+- Fixed stalled repair downloads holding the repair lock indefinitely. Downloads now time out after two minutes per file, clean up staged files, and ignore late responses.
+- Fixed corrupted `main.js` files with Obsidian's `nosourcemap` suffix being reported as repairable but repeatedly rejected as changed before repair.
+- Fixed disabling and re-enabling Sync Assets being treated as an Obsidian restart, allowing repair backups to be deleted too early.
+
 ## [1.0.2] - 2026-09-03
 
 ### Improved

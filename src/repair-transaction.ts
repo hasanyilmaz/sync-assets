@@ -1,6 +1,8 @@
 import type { DataAdapter, Stat } from "obsidian";
 
 import type { IntegrityCheckRun } from "./check-coordinator";
+import { MAX_MANIFEST_BYTES } from "./local-discovery";
+import { validatePluginManifest } from "./plugin-manifest";
 import {
 	type ArtifactFingerprint,
 	type GitHubRepository,
@@ -17,10 +19,15 @@ import {
 	type RepairPlan,
 	type RepairPlanArtifact,
 } from "./repair-plan";
-import type {
-	RemoteHttpClient,
-	RemoteHttpRequest,
+import {
+	RemoteRequestTimeoutError,
+	runWithRemoteTimeout,
+	type RemoteHttpClient,
+	type RemoteHttpRequest,
 } from "./remote-release";
+
+// Large plugin bundles need more time than the small release metadata requests.
+export const REPAIR_DOWNLOAD_TIMEOUT_MS = 120_000;
 
 export const REPAIR_JOURNAL_PHASES = [
 	"planned",
@@ -335,6 +342,7 @@ async function captureGuard(
 	adapter: RepairAdapter,
 	path: string,
 	sha256: Sha256Function,
+	manifestIdentity?: { readonly id: string; readonly version: string },
 ): Promise<GuardResult> {
 	const initial = await stat(adapter, path);
 	if (isProblem(initial)) {
@@ -347,7 +355,7 @@ async function captureGuard(
 		initial.type !== "file"
 		|| !isValidStatNumber(initial.size)
 		|| !isValidStatNumber(initial.mtime)
-		|| initial.size > MAX_HASHABLE_ARTIFACT_BYTES
+		|| initial.size > (manifestIdentity === undefined ? MAX_HASHABLE_ARTIFACT_BYTES : MAX_MANIFEST_BYTES)
 	) {
 		return {
 			ok: false,
@@ -378,6 +386,22 @@ async function captureGuard(
 				? final
 				: reason("repair-file-changed-during-read", `Repair target ${path} changed while it was read.`),
 		};
+	}
+
+	if (manifestIdentity !== undefined) {
+		try {
+			const raw: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+			const validated = validatePluginManifest(raw, {
+				expectedPluginId: manifestIdentity.id,
+				idMismatchCode: "repair-manifest-identity-changed",
+				idMismatchMessage: "The installed plugin identity changed after the integrity check.",
+			});
+			if (!validated.ok || validated.manifest.version !== manifestIdentity.version) {
+				return { ok: false, reason: reason("repair-manifest-identity-changed", "The installed manifest identity or version changed. Run a new integrity check before repairing.") };
+			}
+		} catch {
+			return { ok: false, reason: reason("repair-manifest-unverifiable", "The installed manifest is no longer readable as a valid manifest. Run a new integrity check before repairing.") };
+		}
 	}
 
 	let digest: string;
@@ -516,13 +540,20 @@ async function bytesForArtifact(
 	if (artifact.downloadUrl === null) {
 		return { ok: false, reason: reason("repair-download-url-missing", `${artifact.assetName} lacks a trusted download URL.`) };
 	}
+	const downloadUrl = artifact.downloadUrl;
 	try {
-		const response = await http(downloadRequest(artifact.downloadUrl));
+		const response = await runWithRemoteTimeout(
+			() => http(downloadRequest(downloadUrl)),
+			REPAIR_DOWNLOAD_TIMEOUT_MS,
+		);
 		if (response.status !== 200) {
 			return { ok: false, reason: reason("repair-download-http-error", `${artifact.assetName} download returned HTTP ${response.status}.`) };
 		}
 		return { ok: true, bytes: response.arrayBuffer };
 	} catch (error) {
+		if (error instanceof RemoteRequestTimeoutError) {
+			return { ok: false, reason: reason("repair-download-timeout", `${artifact.assetName} download timed out. Check your connection and try the repair again.`) };
+		}
 		return { ok: false, reason: reason("repair-download-error", `Could not download ${artifact.assetName}: ${getErrorMessage(error)}`) };
 	}
 }
@@ -625,6 +656,23 @@ async function cleanupEmptyWorkspaceDirectories(
 			// externally changed directory is deliberately left untouched.
 		}
 	}
+}
+
+async function verifyManifestIdentity(
+	plan: RepairPlan,
+	adapter: RepairAdapter,
+	sha256: Sha256Function,
+): Promise<OperationResult> {
+	const current = await captureGuard(adapter, `${plan.pluginPath}/manifest.json`, sha256, {
+		id: plan.pluginId,
+		version: plan.manifestVersion,
+	});
+	if (!current.ok) {
+		return current;
+	}
+	return current.guard.exists
+		? { ok: true }
+		: { ok: false, reason: reason("repair-manifest-missing", "The installed manifest disappeared. Run a new integrity check before repairing.") };
 }
 
 async function captureFreshGuards(
@@ -873,6 +921,10 @@ export class RepairTransactionEngine {
 			);
 		}
 
+		const manifestIdentity = await verifyManifestIdentity(plan, this.context.adapter, sha256);
+		if (!manifestIdentity.ok) {
+			return this.finishBeforeMutation("stale", plan, receipt, manifestIdentity.reason, now, stagedByEngine);
+		}
 		const fresh = await captureFreshGuards(plan, this.context.adapter, sha256);
 		if (!fresh.ok) {
 			return this.finishBeforeMutation("stale", plan, receipt, fresh.reason, now, stagedByEngine);
@@ -907,6 +959,10 @@ export class RepairTransactionEngine {
 
 		const applied: AppliedArtifact[] = [];
 		for (const artifact of plan.artifacts) {
+			const currentIdentity = await verifyManifestIdentity(plan, this.context.adapter, sha256);
+			if (!currentIdentity.ok) {
+				return this.rollback(plan, receipt, applied, stagedByEngine, currentIdentity.reason, now, sha256);
+			}
 			const original = fresh.guards.get(artifact.assetName);
 			if (original === undefined) {
 				return this.rollback(plan, receipt, applied, stagedByEngine, reason("repair-guard-missing", "Repair guard disappeared."), now, sha256);
@@ -942,6 +998,10 @@ export class RepairTransactionEngine {
 			}
 		}
 
+		const finalIdentity = await verifyManifestIdentity(plan, this.context.adapter, sha256);
+		if (!finalIdentity.ok) {
+			return this.rollback(plan, receipt, applied, stagedByEngine, finalIdentity.reason, now, sha256);
+		}
 		receipt = updateReceipt(
 			receipt,
 			now(),

@@ -462,7 +462,7 @@ describe("integrity verification", () => {
 			repairEligible: true,
 			acceptedVariant: null,
 		}));
-		expect(main.local.sha256).toBe(digestForText(changedMain));
+		expect(main.local.sha256).toBe(digestForText(`${changedMain}${OBSIDIAN_NO_SOURCE_MAP_SUFFIX}`));
 	});
 
 	it("does not accept the Obsidian main.js suffix on manifest.json", async () => {

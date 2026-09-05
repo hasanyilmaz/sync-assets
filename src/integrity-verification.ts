@@ -94,7 +94,7 @@ type CorrelationResult =
 	| { readonly ok: false; readonly reason: IntegrityReason };
 
 interface VerificationRunState {
-	readonly hashCache: Map<string, string>;
+	readonly hashCache: Map<string, { readonly localDigest: string; readonly matches: boolean }>;
 	readonly sha256: Sha256Function;
 }
 
@@ -538,8 +538,8 @@ async function verifyLocalArtifact(
 		expectedAsset.sha256,
 		possibleObsidianVariant ? "obsidian-nosourcemap-suffix" : "exact",
 	].join("\u0000");
-	let localDigest = state.hashCache.get(cacheKey);
-	if (localDigest === undefined) {
+	let hashEvidence = state.hashCache.get(cacheKey);
+	if (hashEvidence === undefined) {
 		let bytes: ArrayBuffer;
 		try {
 			bytes = await adapter.readBinary(snapshot.path);
@@ -612,8 +612,16 @@ async function verifyLocalArtifact(
 			bytesToHash = bytes.slice(0, expectedAsset.sizeBytes);
 		}
 
+		let localDigest: string;
+		let matches: boolean;
 		try {
 			localDigest = (await state.sha256(bytesToHash)).toLowerCase();
+			matches = localDigest === expectedAsset.sha256;
+			if (possibleObsidianVariant && !matches && isSha256Digest(localDigest)) {
+				// Repair guards hash the entire installed file. Preserve that evidence
+				// for a corrupt variant while comparing the canonical bundle above.
+				localDigest = (await state.sha256(bytes)).toLowerCase();
+			}
 		} catch (error) {
 			return artifactResult(
 				assetName,
@@ -636,10 +644,11 @@ async function verifyLocalArtifact(
 				reason("invalid-hash-result", "SHA-256 implementation returned an invalid digest."),
 			);
 		}
-		state.hashCache.set(cacheKey, localDigest);
+		hashEvidence = { localDigest, matches };
+		state.hashCache.set(cacheKey, hashEvidence);
 	}
 
-	const matches = localDigest === expectedAsset.sha256;
+	const { localDigest, matches } = hashEvidence;
 	return artifactResult(
 		assetName,
 		matches ? "healthy" : "mismatched",
