@@ -342,7 +342,10 @@ export default class SyncAssetsPlugin extends Plugin {
 		const attempts = await recordAllPostRestartHealthyProofs(
 			this.journal,
 			run,
-			this.sessionId,
+			{
+				sessionId: this.sessionId,
+				startedAtMs: window.performance?.timeOrigin ?? Number.NaN,
+			},
 		);
 		for (const attempt of attempts) {
 			if (attempt.result.status !== "recorded" && attempt.result.status !== "persistence-error") {

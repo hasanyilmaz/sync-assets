@@ -35,6 +35,8 @@ import { sha256ArrayBuffer } from "../src/integrity-verification";
 
 const ORIGIN_SESSION = `session-${"1".repeat(32)}`;
 const NEW_SESSION = `session-${"2".repeat(32)}`;
+const RESTARTED_APP_SESSION = { sessionId: NEW_SESSION, startedAtMs: 21 };
+const SAME_APP_SESSION = { sessionId: ORIGIN_SESSION, startedAtMs: 1 };
 const REPAIR_ROOT_PATH = `${OWN_PLUGIN_PATH}/.repair`;
 
 class Storage {
@@ -293,11 +295,11 @@ describe("persistent repair lifecycle", () => {
 		const { journal } = await loadedJournal(stateWithReceipt(receipt), ORIGIN_SESSION);
 
 		expect(isRepairRecordBlocking(journal.getSnapshot().records[0]!)).toBe(false);
-		const sameSession = await recordPostRestartHealthyProof(journal, healthyRun(fixture.run), ORIGIN_SESSION, 30);
+		const sameSession = await recordPostRestartHealthyProof(journal, healthyRun(fixture.run), SAME_APP_SESSION, 30);
 		expect(sameSession.status).toBe("same-session");
 		expect(journal.getSnapshot().records[0]?.healthyProof).toBeNull();
 		const startupRun = { ...healthyRun(fixture.run), trigger: "startup" as const };
-		const recorded = await recordPostRestartHealthyProof(journal, startupRun, NEW_SESSION, 31);
+		const recorded = await recordPostRestartHealthyProof(journal, startupRun, RESTARTED_APP_SESSION, 31);
 		expect(recorded.status).toBe("recorded");
 		expect(journal.getSnapshot().blockingRecord).toBeNull();
 		expect(journal.getSnapshot().records[0]?.backupCleanup.status).toBe("cleanup-eligible");
@@ -345,7 +347,7 @@ describe("persistent repair lifecycle", () => {
 		const attempts = await recordAllPostRestartHealthyProofs(
 			journal,
 			healthyRun(fixture.run),
-			NEW_SESSION,
+			RESTARTED_APP_SESSION,
 			31,
 		);
 
@@ -369,7 +371,7 @@ describe("persistent repair lifecycle", () => {
 		const attempts = await recordAllPostRestartHealthyProofs(
 			journal,
 			healthyRun(fixture.run),
-			NEW_SESSION,
+			RESTARTED_APP_SESSION,
 			31,
 		);
 
@@ -412,7 +414,7 @@ describe("persistent repair lifecycle", () => {
 			},
 		};
 
-		expect((await recordPostRestartHealthyProof(journal, markerRun, NEW_SESSION, 31)).status).toBe("recorded");
+		expect((await recordPostRestartHealthyProof(journal, markerRun, RESTARTED_APP_SESSION, 31)).status).toBe("recorded");
 	});
 
 	it("does not accept the wrong exact release or unhealthy artifacts", async () => {
@@ -431,8 +433,8 @@ describe("persistent repair lifecycle", () => {
 				records: [{ ...remote.records[0], release: { ...remote.records[0].release, releaseId: 45 } }],
 			},
 		};
-		expect((await recordPostRestartHealthyProof(journal, mismatched, NEW_SESSION)).status).toBe("no-match");
-		expect((await recordPostRestartHealthyProof(journal, fixture.run, NEW_SESSION)).status).toBe("no-match");
+		expect((await recordPostRestartHealthyProof(journal, mismatched, RESTARTED_APP_SESSION)).status).toBe("no-match");
+		expect((await recordPostRestartHealthyProof(journal, fixture.run, RESTARTED_APP_SESSION)).status).toBe("no-match");
 	});
 
 	it("verifies every backup before deleting only transaction-owned allowlisted paths", async () => {

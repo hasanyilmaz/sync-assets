@@ -64,6 +64,12 @@ export interface HealthyReconciliationAttempt {
 	readonly result: HealthyReconciliationResult;
 }
 
+export interface AppSessionEvidence {
+	readonly sessionId: string;
+	/** The document's navigation time origin, which survives plugin reloads. */
+	readonly startedAtMs: number;
+}
+
 export type BackupCleanupAdapter = Pick<RepairAdapter, "readBinary" | "remove" | "rmdir" | "stat">;
 
 export type BackupCleanupResult =
@@ -325,11 +331,19 @@ function exactHealthyMatch(run: IntegrityCheckRun, receipt: RepairReceipt): bool
 async function recordCandidateHealthyProof(
 	journal: PersistentRepairJournal,
 	run: IntegrityCheckRun,
-	sessionId: string,
+	session: AppSessionEvidence,
 	candidate: PersistedRepairRecord,
 	nowMs = Date.now(),
 ): Promise<HealthyReconciliationResult> {
-	if (candidate.originSessionId === sessionId) {
+	const { sessionId, startedAtMs } = session;
+	if (
+		candidate.originSessionId === sessionId
+		|| !Number.isFinite(startedAtMs)
+		|| startedAtMs <= 0
+		|| candidate.receipt.finishedAtMs === null
+		|| startedAtMs <= candidate.receipt.finishedAtMs
+		|| startedAtMs > nowMs
+	) {
 		const manifestRepaired = candidate.receipt.artifacts.some(artifact => (
 			artifact.assetName === "manifest.json"
 		));
@@ -374,7 +388,7 @@ async function recordCandidateHealthyProof(
 export async function recordPostRestartHealthyProof(
 	journal: PersistentRepairJournal,
 	run: IntegrityCheckRun,
-	sessionId: string,
+	session: AppSessionEvidence,
 	nowMs = Date.now(),
 ): Promise<HealthyReconciliationResult> {
 	const candidate = journal.getSnapshot().records.find(record => (
@@ -382,13 +396,13 @@ export async function recordPostRestartHealthyProof(
 	));
 	return candidate === undefined
 		? { status: "not-committed", reason: null }
-		: recordCandidateHealthyProof(journal, run, sessionId, candidate, nowMs);
+		: recordCandidateHealthyProof(journal, run, session, candidate, nowMs);
 }
 
 export async function recordAllPostRestartHealthyProofs(
 	journal: PersistentRepairJournal,
 	run: IntegrityCheckRun,
-	sessionId: string,
+	session: AppSessionEvidence,
 	nowMs = Date.now(),
 ): Promise<readonly HealthyReconciliationAttempt[]> {
 	const candidates = journal.getSnapshot().records.filter(record => (
@@ -402,7 +416,7 @@ export async function recordAllPostRestartHealthyProofs(
 			result: await recordCandidateHealthyProof(
 				journal,
 				run,
-				sessionId,
+				session,
 				candidate,
 				nowMs,
 			),

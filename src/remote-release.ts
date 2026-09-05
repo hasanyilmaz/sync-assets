@@ -207,7 +207,7 @@ function defaultSleep(delayMs: number): Promise<void> {
 	});
 }
 
-function defaultRunWithTimeout<T>(
+export function runWithRemoteTimeout<T>(
 	operation: () => Promise<T>,
 	timeoutMs: number,
 ): Promise<T> {
@@ -266,7 +266,7 @@ async function requestWithRetry(
 ): Promise<RemoteRequestAttemptResult> {
 	const now = context.now ?? Date.now;
 	const sleep = context.sleep ?? defaultSleep;
-	const runWithTimeout = context.runWithTimeout ?? defaultRunWithTimeout;
+	const runWithTimeout = context.runWithTimeout ?? runWithRemoteTimeout;
 	const deadlineMs = now() + REMOTE_REQUEST_TOTAL_BUDGET_MS;
 	let latestFailure = availabilityFailure("connection", null);
 
