@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.4] - 2026-09-16
+
+### Fixed
+
+- Fixed successful repair cleanup showing an error when a retained backup is absent on the current device, such as when Obsidian Sync does not transfer an oversized backup or another device already removed it.
+
 ## [1.0.3] - 2026-09-05
 
 ### Fixed

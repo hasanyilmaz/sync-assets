@@ -463,10 +463,7 @@ async function cleanupEmptyTransactionDirectories(
 	}
 }
 
-function problemFromStat(stat: Stat | null, path: string): IntegrityReason | null {
-	if (stat === null) {
-		return reason("backup-missing", `Verified backup is missing: ${path}`);
-	}
+function problemFromStat(stat: Stat, path: string): IntegrityReason | null {
 	if (stat.type !== "file" || !Number.isSafeInteger(stat.size) || stat.size < 0) {
 		return reason("backup-not-file", `Verified backup is not a regular file: ${path}`);
 	}
@@ -513,6 +510,8 @@ export async function deleteVerifiedBackups(
 			return { status: "needs-attention", reason: reason("repair-record-remove-error", error instanceof Error ? error.message : "Could not remove repair history.") };
 		}
 	}
+	const missingAssetNames: ReleaseAssetName[] = [];
+	const presentBackups: typeof backups = [];
 	for (const artifact of backups) {
 		if (
 			!isValidBackupPath(record, artifact.assetName, artifact.backupPath, repairRootPath)
@@ -522,9 +521,13 @@ export async function deleteVerifiedBackups(
 		}
 		try {
 			const stat = await adapter.stat(artifact.backupPath);
+			if (stat === null) {
+				missingAssetNames.push(artifact.assetName);
+				continue;
+			}
 			const statProblem = problemFromStat(stat, artifact.backupPath);
-			if (statProblem !== null || stat === null) {
-				return { status: "blocked", reason: statProblem ?? reason("backup-stat-error", "Backup stat failed.") };
+			if (statProblem !== null) {
+				return { status: "blocked", reason: statProblem };
 			}
 			if (stat.size !== artifact.original.sizeBytes) {
 				return { status: "blocked", reason: reason("backup-size-mismatch", `Backup size changed: ${artifact.backupPath}`) };
@@ -542,6 +545,7 @@ export async function deleteVerifiedBackups(
 			) {
 				return { status: "blocked", reason: reason("backup-changed-during-verification", `Backup changed while it was verified: ${artifact.backupPath}`) };
 			}
+			presentBackups.push(artifact);
 		} catch (error) {
 			return { status: "blocked", reason: reason("backup-verification-error", error instanceof Error ? error.message : "Could not verify backup.") };
 		}
@@ -549,12 +553,19 @@ export async function deleteVerifiedBackups(
 	try {
 		await journal.updateRecord(transactionId, current => ({
 			...current,
-			backupCleanup: { ...current.backupCleanup, status: "deleting", reason: null },
+			backupCleanup: {
+				...current.backupCleanup,
+				status: "deleting",
+				// A missing backup is already absent from this device, so it is as
+				// complete for cleanup purposes as a backup deleted here.
+				deletedAssetNames: missingAssetNames,
+				reason: null,
+			},
 		}));
 	} catch (error) {
 		return { status: "needs-attention", reason: reason("backup-cleanup-journal-error", error instanceof Error ? error.message : "Could not start backup cleanup journal.") };
 	}
-	for (const artifact of backups) {
+	for (const artifact of presentBackups) {
 		try {
 			await adapter.remove(artifact.backupPath);
 			await journal.updateRecord(transactionId, current => ({
@@ -565,6 +576,20 @@ export async function deleteVerifiedBackups(
 				},
 			}));
 		} catch (error) {
+			try {
+				if (await adapter.stat(artifact.backupPath) === null) {
+					await journal.updateRecord(transactionId, current => ({
+						...current,
+						backupCleanup: {
+							...current.backupCleanup,
+							deletedAssetNames: [...current.backupCleanup.deletedAssetNames, artifact.assetName],
+						},
+					}));
+					continue;
+				}
+			} catch {
+				// Preserve the original removal error when absence cannot be confirmed.
+			}
 			const cleanupReason = reason("backup-cleanup-partial", error instanceof Error ? error.message : "Backup cleanup stopped after a partial failure.");
 			try {
 				await journal.updateRecord(transactionId, current => ({
