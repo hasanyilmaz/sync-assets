@@ -167,6 +167,24 @@ function seedTransactionDirectories(
 	adapter.seedFolder(`${workspacePath}/backup`);
 }
 
+function cleanupEligibleState(receipt: RepairReceipt): SyncAssetsPersistedData {
+	const base = stateWithReceipt(receipt);
+	return {
+		...base,
+		repairRecords: [{
+			...base.repairRecords[0]!,
+			healthyProof: {
+				sessionId: NEW_SESSION,
+				runId: 10,
+				verifiedAtMs: 30,
+				releaseId: receipt.releaseId,
+				releaseTag: receipt.releaseTag,
+			},
+			backupCleanup: { status: "cleanup-eligible", deletedAssetNames: [], reason: null },
+		}],
+	};
+}
+
 function healthyRun(run: IntegrityCheckRun): IntegrityCheckRun {
 	const verification = run.verification;
 	if (verification === null || verification.records[0]?.outcome !== "evaluated") {
@@ -482,6 +500,107 @@ describe("persistent repair lifecycle", () => {
 		expect(adapter.calls.filter(call => call.startsWith("remove:"))).toEqual([`remove:${main.backupPath}`]);
 		expect(await adapter.stat(`${REPAIR_ROOT_PATH}/${TRANSACTION_ID}`)).toBeNull();
 		expect(journal.getSnapshot().records).toEqual([]);
+	});
+
+	it("completes verified cleanup when every retained backup is missing on this device", async () => {
+		const fixture = await createRepairFixture(false);
+		const receipt = committedReceipt(fixture.run);
+		const { journal } = await loadedJournal(cleanupEligibleState(receipt));
+		const adapter = new FakeRepairAdapter();
+		seedTransactionDirectories(adapter);
+
+		const result = await deleteVerifiedBackups(journal, TRANSACTION_ID, adapter, REPAIR_ROOT_PATH, true);
+
+		expect(result.status).toBe("deleted");
+		expect(adapter.calls.some(call => call.startsWith("remove:"))).toBe(false);
+		expect(await adapter.stat(`${REPAIR_ROOT_PATH}/${TRANSACTION_ID}`)).toBeNull();
+		expect(journal.getSnapshot().records).toEqual([]);
+	});
+
+	it("does not accept missing backups before the repair has a healthy restart proof", async () => {
+		const fixture = await createRepairFixture(false);
+		const receipt = committedReceipt(fixture.run);
+		const { journal } = await loadedJournal(stateWithReceipt(receipt));
+		const adapter = new FakeRepairAdapter();
+
+		const result = await deleteVerifiedBackups(journal, TRANSACTION_ID, adapter, REPAIR_ROOT_PATH, true);
+
+		expect(result.status).toBe("blocked");
+		expect(result.status === "blocked" ? result.reason.code : null).toBe("backup-cleanup-not-eligible");
+		expect(adapter.calls).toEqual([]);
+		expect(journal.getSnapshot().records).toHaveLength(1);
+	});
+
+	it("deletes present backups and accepts other retained backups as already absent", async () => {
+		const fixture = await createRepairFixture(true);
+		const receipt = committedReceipt(fixture.run);
+		const retained = receipt.artifacts.filter(artifact => artifact.backupRetained);
+		const present = retained.find(artifact => artifact.assetName === "manifest.json");
+		if (present === undefined || present.original?.exists !== true) {
+			throw new Error("Expected a retained non-main backup fixture.");
+		}
+		const { journal } = await loadedJournal(cleanupEligibleState(receipt));
+		const adapter = new FakeRepairAdapter();
+		seedTransactionDirectories(adapter);
+		adapter.seedFile(present.backupPath, fixture.originalFiles["manifest.json"]);
+
+		const result = await deleteVerifiedBackups(journal, TRANSACTION_ID, adapter, REPAIR_ROOT_PATH, true);
+
+		expect(result.status).toBe("deleted");
+		expect(adapter.calls.filter(call => call.startsWith("remove:"))).toEqual([`remove:${present.backupPath}`]);
+		expect(journal.getSnapshot().records).toEqual([]);
+	});
+
+	it("completes cleanup when a verified backup disappears immediately before removal", async () => {
+		const fixture = await createRepairFixture(false);
+		const receipt = committedReceipt(fixture.run);
+		const main = receipt.artifacts.find(artifact => artifact.assetName === "main.js");
+		if (main === undefined || main.original?.exists !== true) {
+			throw new Error("Expected a retained main backup fixture.");
+		}
+		const mainOnly: RepairReceipt = {
+			...receipt,
+			artifacts: receipt.artifacts.map(artifact => ({
+				...artifact,
+				backupRetained: artifact.assetName === "main.js",
+			})),
+		};
+		const { journal } = await loadedJournal(cleanupEligibleState(mainOnly));
+		const adapter = new FakeRepairAdapter();
+		seedTransactionDirectories(adapter);
+		adapter.seedFile(main.backupPath, fixture.originalFiles["main.js"]);
+		adapter.failRemove = (path): boolean => {
+			adapter.entries.delete(path);
+			return true;
+		};
+
+		const result = await deleteVerifiedBackups(journal, TRANSACTION_ID, adapter, REPAIR_ROOT_PATH, true);
+
+		expect(result.status).toBe("deleted");
+		expect(journal.getSnapshot().records).toEqual([]);
+	});
+
+	it("still blocks cleanup when a missing backup accompanies a corrupted present backup", async () => {
+		const fixture = await createRepairFixture(true);
+		const receipt = committedReceipt(fixture.run);
+		const present = receipt.artifacts.find(artifact => artifact.backupRetained && artifact.assetName === "manifest.json");
+		if (present === undefined) {
+			throw new Error("Expected a retained non-main backup fixture.");
+		}
+		const { journal } = await loadedJournal(cleanupEligibleState(receipt));
+		const adapter = new FakeRepairAdapter();
+		seedTransactionDirectories(adapter);
+		adapter.seedFile(present.backupPath, textBytes("tampered"));
+
+		const result = await deleteVerifiedBackups(journal, TRANSACTION_ID, adapter, REPAIR_ROOT_PATH, true);
+
+		expect(result.status).toBe("blocked");
+		expect(adapter.calls.some(call => call.startsWith("remove:"))).toBe(false);
+		expect(journal.getSnapshot().records[0]?.backupCleanup).toEqual({
+			status: "cleanup-eligible",
+			deletedAssetNames: [],
+			reason: null,
+		});
 	});
 
 	it("rejects a persisted backup path outside the trusted repair root", async () => {
